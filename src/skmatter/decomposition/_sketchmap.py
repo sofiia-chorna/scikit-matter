@@ -9,7 +9,7 @@ import warnings
 
 import numpy as np
 from scipy import sparse
-from scipy.optimize import minimize
+from scipy.optimize import basinhopping, minimize
 from scipy.spatial.distance import pdist, squareform
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted, validate_data
@@ -42,20 +42,39 @@ class SketchMap(TransformerMixin, BaseEstimator):
     auto_histogram : bool, default=True
         If True, estimate sigma from pairwise-distance histogram.
 
+    mds_opt_steps : int, default=100
+        Number of optimization steps with identity transform after classical MDS.
+        This matches the C++ iterative MDS step that optimizes raw distance
+        stress before applying sigmoid transforms. Set to 0 to skip.
+
+    optimizer : str, default="L-BFGS-B"
+        Optimization method. Options:
+        - "L-BFGS-B": Limited-memory BFGS with bounds (default, fast)
+        - "CG": Conjugate Gradient using Polak-Ribière formula
+          (matches C++ implementation more closely)
+
     preopt_steps : int, default=100
-        Number of pre-optimization steps with identity transform.
+        Number of pre-optimization steps with sigmoid transform.
 
     opt_steps : int, default=100
-        Number of optimization steps with sigmoid transform.
+        Number of main optimization steps with sigmoid transform.
 
-    global_opt_steps : int, default=0
-        Number of global optimization steps (not implemented).
+    global_opt : int or None, default=None
+        Number of basin-hopping iterations for global optimization.
+        If provided, uses scipy's basin-hopping algorithm to escape local
+        minima by combining local optimization with random perturbations.
+        Typical values: 5-20 iterations. Set to None to disable.
 
     mixing_ratio : float, default=0.0
         Balance between direct (1.0) and transformed (0.0) stress.
 
     center : bool, default=True
         If True, center the input data around origin.
+
+    init : array-like or None, default=None
+        Initial embedding coordinates. If provided, skip MDS initialization
+        and start optimization from this embedding. Useful for reproducing
+        C++ results by using the same initialization.
 
     random_state : int or None
         Random seed.
@@ -73,11 +92,14 @@ class SketchMap(TransformerMixin, BaseEstimator):
         a_ld=2.0,
         b_ld=6.0,
         auto_histogram=True,
+        mds_opt_steps=100,
+        optimizer="L-BFGS-B",
         preopt_steps=100,
         opt_steps=100,
-        global_opt_steps=0,
+        global_opt=None,
         mixing_ratio=0.0,
         center=True,
+        init=None,
         random_state=None,
         verbose=False,
     ):
@@ -88,11 +110,14 @@ class SketchMap(TransformerMixin, BaseEstimator):
         self.a_ld = a_ld
         self.b_ld = b_ld
         self.auto_histogram = auto_histogram
+        self.mds_opt_steps = mds_opt_steps
+        self.optimizer = optimizer
         self.preopt_steps = preopt_steps
         self.opt_steps = opt_steps
-        self.global_opt_steps = global_opt_steps
+        self.global_opt = global_opt
         self.mixing_ratio = mixing_ratio
         self.center = center
+        self.init = init
         self.random_state = random_state
         self.verbose = verbose
         self._first_stress_call = True
@@ -106,6 +131,36 @@ class SketchMap(TransformerMixin, BaseEstimator):
             val = 1.0 - (1.0 + term) ** (-b / a)
             val[distances <= 0.0] = 0.0
         return val
+
+    def _sigmoid_inverse(self, y, sigma, a, b):
+        """Inverse of sigmoid: maps transformed distance back to raw distance.
+
+        Given y = 1-(1+(2^(a/b)-1)(x/s)^a)^(-b/a)
+        Return x = s * (((1-y)^(-a/b) - 1) / (2^(a/b)-1))^(1/a)
+        """
+        with np.errstate(divide="ignore", invalid="ignore"):
+            A = 2 ** (a / b) - 1.0
+            # (1-y)^(-a/b) = (1+term)
+            # term = (1-y)^(-a/b) - 1
+            # A * (x/s)^a = term
+            # x = s * (term/A)^(1/a)
+            one_minus_y = np.maximum(1.0 - y, 1e-12)  # Avoid division by zero
+            inner = np.power(one_minus_y, -a / b) - 1.0
+            val = sigma * np.power(np.maximum(inner / A, 0.0), 1.0 / a)
+            val[y <= 0.0] = 0.0
+            val[y >= 1.0] = np.inf
+        return val
+
+    def _warp_distances(self, D_hd):
+        """Warp HD distances to target LD distances: f_ld^{-1}(f_hd(D_hd)).
+
+        This is used for MDS initialization (like C++ -warp flag).
+        """
+        # Apply HD sigmoid
+        S_hd = self._sigmoid_transform(D_hd, self.sigma_, self.a_hd, self.b_hd)
+        # Apply inverse LD sigmoid to get target LD distances
+        D_ld_target = self._sigmoid_inverse(S_hd, self.sigma_, self.a_ld, self.b_ld)
+        return D_ld_target
 
     def _sigmoid_derivative(self, distances, sigma, a, b):
         """Derivative of sigmoid with respect to distance."""
@@ -176,8 +231,10 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         return sigma
 
-    def _compute_stress(self, X_ld, D_hd, S_hd, W, mixing_ratio, use_transform=True):
-        """Compute sketch-map stress function.
+    def _compute_stress(
+        self, X_ld, D_hd, S_hd, W, tw, mixing_ratio, use_transform=True
+    ):
+        """Compute sketch-map stress function (C++ compatible).
 
         Parameters
         ----------
@@ -188,9 +245,11 @@ class SketchMap(TransformerMixin, BaseEstimator):
         S_hd : array, shape (n, n)
             Transformed high-dimensional distances
         W : array, shape (n, n)
-            Weight matrix
+            Weight matrix (pair weights w_i * w_j)
+        tw : float
+            Total weight (sum of upper-triangle weights)
         mixing_ratio : float
-            Balance between direct and transformed stress
+            Balance between direct (1.0) and transformed (0.0) stress
         use_transform : bool
             Whether to apply sigmoid transform to low-dim distances
         """
@@ -210,37 +269,36 @@ class SketchMap(TransformerMixin, BaseEstimator):
         else:
             S_ld = D_ld
 
-        # Compute stress components
-        direct_stress = np.sum(W * (D_hd - D_ld) ** 2)
-        transformed_stress = np.sum(W * (S_hd - S_ld) ** 2)
+        # Compute stress using upper triangle only (like C++)
+        # C++ formula: sum_{i>j} [(S_hd-S_ld)^2*(1-mix) + mix*(D_hd-D_ld)^2] * W
+        triu_idx = np.triu_indices_from(D_hd, k=1)
+        diff_transformed = (S_hd[triu_idx] - S_ld[triu_idx]) ** 2
+        diff_direct = (D_hd[triu_idx] - D_ld[triu_idx]) ** 2
+        weights_triu = W[triu_idx]
 
-        combined_stress = (
-            mixing_ratio * direct_stress + (1 - mixing_ratio) * transformed_stress
+        combined_stress = np.sum(
+            weights_triu
+            * ((1.0 - mixing_ratio) * diff_transformed + mixing_ratio * diff_direct)
         )
 
-        # Debug logging on first call
-        if self.verbose and self._first_stress_call:
-            print("\n=== First Stress Calculation Debug ===")
-            print(f"High-dim distances (sample 3x3):\n{D_hd[:3, :3]}")
-            print(f"\nLow-dim distances (sample 3x3):\n{D_ld[:3, :3]}")
-            print(f"\nTransformed high-dim (sample 3x3):\n{S_hd[:3, :3]}")
-            print(f"Transformed low-dim (sample 3x3):\n{S_ld[:3, :3]}")
-            print(f"\nWeights (sample 3x3):\n{W[:3, :3]}")
-            print(f"Weight sum: {np.sum(W):.4f}")
-            print("\nStress components:")
-            print(f"  Direct stress: {direct_stress:.4f}")
-            print(f"  Transformed stress: {transformed_stress:.4f}")
-            print(f"  Combined stress: {combined_stress:.4f}")
-            print(f"  Mixing ratio: {mixing_ratio:.2f}")
-            print(f"  Normalized stress: {combined_stress / np.sum(W):.6f}")
-            print("=" * 40 + "\n")
-            self._first_stress_call = False
+        # Normalize by total weight
+        return combined_stress / tw
 
-        # Normalize by sum of weights
-        return combined_stress / np.sum(W)
+    def _compute_gradient(
+        self, X_ld, D_hd, S_hd, W, tw, mixing_ratio, use_transform=True
+    ):
+        """Compute gradient of stress function (C++ compatible).
 
-    def _compute_gradient(self, X_ld, D_hd, S_hd, W, mixing_ratio, use_transform=True):
-        """Compute gradient of stress function."""
+        For imix=0 (pure transformed stress):
+            gij = (S_hd - S_ld) * dS_dD
+            grad[i] += gij * (x_i - x_j)  [no division by D_ld]
+
+        For imix>0 (mixed stress):
+            gij = ((S_hd - S_ld)*dS_dD*(1-mix) + mix*(D_hd - D_ld)) / D_ld
+            grad[i] += gij * (x_i - x_j)
+
+        Final: grad *= -2.0 / tw
+        """
         # Handle both flat and matrix inputs
         if X_ld.ndim == 1:
             n = D_hd.shape[0]
@@ -260,50 +318,181 @@ class SketchMap(TransformerMixin, BaseEstimator):
             S_ld = D_ld
             dS_dD = np.ones_like(D_ld)
 
-        # Avoid division by zero
-        eps = np.finfo(float).eps
-        inv_D = 1.0 / (D_ld + eps)
-
-        # Gradient matrix
-        M = (
-            W
-            * (
-                mixing_ratio * (D_ld - D_hd)
-                + (1 - mixing_ratio) * (S_ld - S_hd) * dS_dD
+        # C++ gradient formula depends on mixing_ratio:
+        # For imix=0: gij = (S_hd - S_ld) * dS_dD  (no /D_ld)
+        # For imix>0: gij = ((S_hd - S_ld)*dS_dD*(1-imix) + imix*(D_hd - D_ld))/D_ld
+        if mixing_ratio == 0.0:
+            M = W * (S_hd - S_ld) * dS_dD
+        else:
+            eps = 1e-100
+            inv_D = 1.0 / np.maximum(D_ld, eps)
+            M = (
+                W
+                * (
+                    (1.0 - mixing_ratio) * (S_hd - S_ld) * dS_dD
+                    + mixing_ratio * (D_hd - D_ld)
+                )
+                * inv_D
             )
-            * inv_D
-        )
         np.fill_diagonal(M, 0.0)
 
         row_sums = M.sum(axis=1)
         G = (row_sums[:, None] * X_ld_mat) - (M @ X_ld_mat)
 
-        # Normalize by sum of weights and apply factor of 2
-        G = 2.0 * G / np.sum(W)
+        # C++ normalization: *= -2.0/tw
+        G = -2.0 * G / tw
 
         return G.ravel()
 
     def _optimize(
-        self, X_init, D_hd, S_hd, W, mixing_ratio, n_steps, use_transform=True
+        self, X_init, D_hd, S_hd, W, tw, mixing_ratio, n_steps, use_transform=True
     ):
-        """Run L-BFGS-B optimization."""
+        """Run optimization using the configured optimizer.
+
+        Parameters
+        ----------
+        X_init : ndarray
+            Initial embedding coordinates.
+        D_hd : ndarray
+            High-dimensional pairwise distances.
+        S_hd : ndarray
+            Transformed high-dimensional distances.
+        W : ndarray
+            Weight matrix.
+        tw : float
+            Total weight (sum of upper triangle of W).
+        mixing_ratio : float
+            Balance between direct and transformed stress.
+        n_steps : int
+            Maximum number of optimization iterations.
+        use_transform : bool
+            Whether to apply sigmoid transform to low-dimensional distances.
+
+        Returns
+        -------
+        X_opt : ndarray
+            Optimized embedding coordinates.
+        stress : float
+            Final stress value.
+        """
         n = X_init.shape[0]
         x0 = X_init.ravel()
 
         def objective(x):
-            return self._compute_stress(x, D_hd, S_hd, W, mixing_ratio, use_transform)
+            return self._compute_stress(
+                x, D_hd, S_hd, W, tw, mixing_ratio, use_transform
+            )
 
         def gradient(x):
-            return self._compute_gradient(x, D_hd, S_hd, W, mixing_ratio, use_transform)
+            return self._compute_gradient(
+                x, D_hd, S_hd, W, tw, mixing_ratio, use_transform
+            )
 
-        # Optimize
-        result = minimize(
+        # Choose optimizer
+        if self.optimizer == "CG":
+            # Conjugate Gradient with Polak-Ribière (matches C++ implementation)
+            result = minimize(
+                objective,
+                x0,
+                method="CG",
+                jac=gradient,
+                options={"maxiter": n_steps, "disp": False, "gtol": 1e-8},
+            )
+        else:
+            # L-BFGS-B (default, faster but may converge to different minimum)
+            result = minimize(
+                objective,
+                x0,
+                method="L-BFGS-B",
+                jac=gradient,
+                options={"maxiter": n_steps, "disp": False, "gtol": 1e-8},
+            )
+
+        if self.verbose:
+            print(f"  Optimization finished: stress = {result.fun:.6f}")
+
+        return result.x.reshape((n, self.n_components)), result.fun
+
+    def _global_optimize_basinhopping(
+        self, X_ld, D_hd, S_hd, W, tw, n_iterations
+    ):
+        """Perform global optimization using basin hopping.
+
+        Basin hopping combines local optimization with random perturbations
+        to escape local minima.
+
+        Parameters
+        ----------
+        X_ld : ndarray, shape (n_samples, n_components)
+            Current embedding.
+        D_hd : ndarray, shape (n_samples, n_samples)
+            High-dimensional distances.
+        S_hd : ndarray, shape (n_samples, n_samples)
+            Transformed high-dimensional distances.
+        W : ndarray, shape (n_samples, n_samples)
+            Weight matrix.
+        tw : float
+            Total weight.
+        n_iterations : int
+            Number of basin hopping iterations.
+
+        Returns
+        -------
+        X_ld : ndarray
+            Optimized embedding.
+        stress : float
+            Final stress value.
+        """
+        n = X_ld.shape[0]
+        x0 = X_ld.ravel()
+
+        def objective(x):
+            return self._compute_stress(
+                x, D_hd, S_hd, W, tw, self.mixing_ratio, use_transform=True
+            )
+
+        def gradient(x):
+            return self._compute_gradient(
+                x, D_hd, S_hd, W, tw, self.mixing_ratio, use_transform=True
+            )
+
+        # Local minimizer options
+        minimizer_kwargs = {
+            "method": self.optimizer,
+            "jac": gradient,
+            "options": {"maxiter": 100, "disp": False},
+        }
+
+        if self.verbose:
+            print(f"\n=== Global optimization (basin hopping, {n_iterations} iter) ===")
+
+        # Set random state for reproducibility
+        rng = np.random.default_rng(self.random_state)
+
+        # Custom step function with controlled step size
+        class RandomDisplacement:
+            def __init__(self, stepsize=1.0, rng=None):
+                self.stepsize = stepsize
+                self.rng = rng if rng is not None else np.random.default_rng()
+
+            def __call__(self, x):
+                return x + self.rng.uniform(-self.stepsize, self.stepsize, x.shape)
+
+        # Estimate step size from current embedding scale
+        scale = np.std(X_ld)
+        take_step = RandomDisplacement(stepsize=scale * 0.5, rng=rng)
+
+        result = basinhopping(
             objective,
             x0,
-            method="L-BFGS-B",
-            jac=gradient,
-            options={"maxiter": n_steps, "disp": int(self.verbose)},
+            niter=n_iterations,
+            minimizer_kwargs=minimizer_kwargs,
+            take_step=take_step,
+            seed=int(rng.integers(0, 2**31)) if self.random_state else None,
         )
+
+        if self.verbose:
+            print(f"  Basin hopping finished: stress = {result.fun:.6f}")
 
         return result.x.reshape((n, self.n_components)), result.fun
 
@@ -377,7 +566,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         # Transform high-dimensional distances (for stage 2)
         S_hd = self._sigmoid_transform(D_hd, self.sigma_, self.a_hd, self.b_hd)
 
-        # Setup weight matrix: W_ij = w_i * w_j
+        # Setup weight matrix: W_ij = w_i * w_j (like C++)
         if sample_weights is not None:
             w = np.asarray(sample_weights)
             if w.shape[0] != n_samples:
@@ -385,44 +574,89 @@ class SketchMap(TransformerMixin, BaseEstimator):
                     f"sample_weights must have length {n_samples}, got {w.shape[0]}"
                 )
             W = np.outer(w, w)
+            # Total weight is sum of upper triangle (like C++)
+            tw = np.sum(np.triu(W, k=1))
             if self.verbose:
-                print(f"Weight matrix: sum={np.sum(W):.4f}, shape={W.shape}")
+                print(f"Weight matrix: tw={tw:.4f}, shape={W.shape}")
         else:
             W = np.ones_like(D_hd)
+            # For unweighted case, tw = n*(n-1)/2 (like C++)
+            tw = n_samples * (n_samples - 1) / 2.0
             if self.verbose:
-                print("Using uniform weights")
+                print(f"Using uniform weights, tw={tw:.4f}")
 
         # Reset debug flag
         self._first_stress_call = True
 
-        # Initialize with classical MDS
-        if self.verbose:
-            print("Initializing with classical MDS...")
-        X_ld = self._classical_mds(D_hd)
+        # Initialize embedding
+        if self.init is not None:
+            # Use provided initialization (e.g., from C++ lowd.imds)
+            X_ld = np.asarray(self.init).copy()
+            if self.verbose:
+                print(f"Using provided initialization, shape={X_ld.shape}")
+        else:
+            # Initialize with classical MDS on raw distances
+            if self.verbose:
+                print("Initializing with classical MDS on raw distances...")
+            X_ld = self._classical_mds(D_hd)
 
-        # Stage 1: Pre-optimization with identity transform
+        # Stage 0: MDS optimization with identity transform (like C++ lowd.imds)
+        # This matches C++ iterative MDS that optimizes raw distance stress
+        if self.mds_opt_steps > 0 and self.init is None:
+            if self.verbose:
+                print("\n=== Stage 0: MDS optimization (identity transform) ===")
+                print(f"Running {self.mds_opt_steps} optimization steps...")
+
+            X_ld, mds_stress = self._optimize(
+                X_ld,
+                D_hd,
+                D_hd,  # Use raw distances (identity transform)
+                W,
+                tw,
+                mixing_ratio=1.0,  # 100% direct distance stress
+                n_steps=self.mds_opt_steps,
+                use_transform=False,  # No sigmoid transform
+            )
+
+            if self.verbose:
+                print(f"MDS optimization stress: {mds_stress:.6f}")
+
+        # Stage 1: Pre-optimization with sigmoid transform
         if self.preopt_steps > 0:
             if self.verbose:
-                print("\n=== Stage 1: Pre-optimization with identity transform ===")
+                print("\n=== Stage 1: Pre-optimization (sigmoid transform) ===")
                 print(f"Running {self.preopt_steps} optimization steps...")
 
             X_ld, stress = self._optimize(
                 X_ld,
                 D_hd,
-                D_hd,
-                W,  # Use D_hd for both (identity)
+                S_hd,  # Use sigmoid-transformed HD distances
+                W,
+                tw,
                 self.mixing_ratio,
                 self.preopt_steps,
-                use_transform=False,
+                use_transform=True,  # Use sigmoid transform
             )
 
             if self.verbose:
                 print(f"Pre-optimization stress: {stress:.6f}")
 
-        # Stage 2: Refinement with sigmoid transform
+        # Global optimization (basin hopping)
+        if self.global_opt is not None:
+            if not isinstance(self.global_opt, int) or self.global_opt < 1:
+                raise ValueError(
+                    f"global_opt must be a positive integer (number of iterations), "
+                    f"got {self.global_opt}"
+                )
+
+            X_ld, stress = self._global_optimize_basinhopping(
+                X_ld, D_hd, S_hd, W, tw, self.global_opt
+            )
+
+        # Stage 2: Main optimization (continuation)
         if self.opt_steps > 0:
             if self.verbose:
-                print("\n=== Stage 2: Refinement with sigmoid transform ===")
+                print("\n=== Stage 2: Main optimization (sigmoid transform) ===")
                 print(f"Running {self.opt_steps} optimization steps...")
 
             # Reset debug flag for second stage
@@ -433,6 +667,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
                 D_hd,
                 S_hd,
                 W,
+                tw,
                 self.mixing_ratio,
                 self.opt_steps,
                 use_transform=True,
@@ -440,10 +675,6 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
             if self.verbose:
                 print(f"Final stress: {stress:.6f}")
-
-        # Note: Global optimization not implemented
-        if self.global_opt_steps > 0:
-            warnings.warn("Global optimization not yet implemented, skipping")
 
         self.embedding_ = X_ld
         self.stress_ = stress
