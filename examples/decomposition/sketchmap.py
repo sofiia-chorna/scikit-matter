@@ -59,18 +59,9 @@ print(f"Weights: min={weights.min():.4f}, max={weights.max():.4f}")
 
 sm = SketchMap(
     n_components=2,
-    sigma=7.0,
-    a_hd=4.0,
-    b_hd=2.0,
-    a_ld=2.0,
-    b_ld=2.0,
-    #auto_params=True,
-    mds_opt_steps=100,
+    params={"sigma": 7.0, "a_hd": 4.0, "b_hd": 2.0, "a_ld": 2.0, "b_ld": 2.0 },
     optimizer="L-BFGS-B",
-    preopt_steps=100,
-    opt_steps=1000,
     mixing_ratio=0.0,
-    center=True,
     verbose=True,
     global_opt=1
 )
@@ -86,13 +77,17 @@ print(f"\nPython final stress (from MDS init): {sm.stress_:.6f}")
 # Note: C++ uses Polak-Ribière CG optimizer, which converges to a slightly
 # different local minimum than L-BFGS-B. Both produce valid embeddings.
 
-T_cpp = np.loadtxt("lowd.gmds_10", skiprows=5)[:, :2]
-
+#T_cpp = np.loadtxt("lowd.gmds_10", skiprows=5)[:, :2]
+T_cpp = np.loadtxt("low_landmarks.dat")[:, :2]
 
 # Compute stress of C++ embedding using Python implementation
+from skmatter.decomposition._sketchmap import sigmoid_transform
+
 X_work = X_land - X_land.mean(axis=0, keepdims=True)
 D_hd = squareform(pdist(X_work, metric="euclidean"))
-S_hd = sm._sigmoid_transform(D_hd, sm.sigma_, sm.a_hd_, sm.b_hd_)
+S_hd = sigmoid_transform(
+    D_hd, sm.params_["sigma"], sm.params_["a_hd"], sm.params_["b_hd"]
+)
 W = np.outer(weights, weights)
 tw = np.sum(np.triu(W, k=1))
 cpp_stress_recomputed = sm._compute_stress(
