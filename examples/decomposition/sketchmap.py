@@ -49,9 +49,6 @@ print(f"Weights: min={weights.min():.4f}, max={weights.max():.4f}")
 # Verify Python exactly reproduces C++ stress by starting from the C++ result.
 # This proves that the stress function implementation is correct.
 
-# Load C++ sketchmap result
-cpp_ismap = np.loadtxt("lowd.ismap", skiprows=5)[:, :2]
-
 # %%
 #
 # Now fit SketchMap from scratch (default behavior).
@@ -67,9 +64,9 @@ sm = SketchMap(
     b_hd=2.0,
     a_ld=2.0,
     b_ld=2.0,
-    auto_histogram=False,
-    mds_opt_steps=100,  # Identity transform optimization (like C++ lowd.imds)
-    optimizer="L-BFGS-B",  # L-BFGS-B is more stable than CG
+    #auto_params=True,
+    mds_opt_steps=100,
+    optimizer="L-BFGS-B",
     preopt_steps=100,
     opt_steps=1000,
     mixing_ratio=0.0,
@@ -89,12 +86,13 @@ print(f"\nPython final stress (from MDS init): {sm.stress_:.6f}")
 # Note: C++ uses Polak-Ribière CG optimizer, which converges to a slightly
 # different local minimum than L-BFGS-B. Both produce valid embeddings.
 
-T_cpp = cpp_ismap  # Use the already-loaded C++ result
+T_cpp = np.loadtxt("lowd.gmds_10", skiprows=5)[:, :2]
+
 
 # Compute stress of C++ embedding using Python implementation
 X_work = X_land - X_land.mean(axis=0, keepdims=True)
 D_hd = squareform(pdist(X_work, metric="euclidean"))
-S_hd = sm._sigmoid_transform(D_hd, sm.sigma_, sm.a_hd, sm.b_hd)
+S_hd = sm._sigmoid_transform(D_hd, sm.sigma_, sm.a_hd_, sm.b_hd_)
 W = np.outer(weights, weights)
 tw = np.sum(np.triu(W, k=1))
 cpp_stress_recomputed = sm._compute_stress(

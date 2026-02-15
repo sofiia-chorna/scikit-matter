@@ -1,15 +1,8 @@
-"""Complete Sketch-Map implementation in Python matching PyTorch version
-
-This implementation follows the two-stage optimization approach:
-1. Pre-optimization with identity transform
-2. Refinement with sigmoid transform
-"""
-
 import warnings
 
 import numpy as np
 from scipy import sparse
-from scipy.optimize import basinhopping, minimize
+from scipy.optimize import basinhopping, minimize, curve_fit
 from scipy.spatial.distance import pdist, squareform
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted, validate_data
@@ -18,29 +11,40 @@ from sklearn.utils.validation import check_is_fitted, validate_data
 class SketchMap(TransformerMixin, BaseEstimator):
     """Sketch-Map dimensionality reducer.
 
+    Sketch-Map transforms distances using sigmoid functions to focus on
+    intermediate-range structure, ignoring both very short distances
+    (Gaussian fluctuations) and very long distances (high-D topology effects).
+
     Parameters
     ----------
     n_components : int, default=2
         Dimensionality of the target embedding.
 
     sigma : float, default=None
-        Sigmoid parameter for both high and low dimensional transforms.
-        If None, estimated automatically from distance histogram.
+        Sigmoid switching distance. Points closer than sigma are considered
+        "close", points farther are "far". If None and auto_params=True,
+        estimated from pairwise distance histogram.
 
-    a_hd : float, default=2.0
-        High-dimensional sigmoid exponent a.
+    a_hd : float, default=None
+        High-dimensional sigmoid exponent a (controls short-range steepness).
+        If None and auto_params=True, estimated from data.
 
-    b_hd : float, default=6.0
-        High-dimensional sigmoid exponent b.
+    b_hd : float, default=None
+        High-dimensional sigmoid exponent b (controls long-range steepness).
+        If None and auto_params=True, estimated from data.
 
-    a_ld : float, default=2.0
-        Low-dimensional sigmoid exponent a.
+    a_ld : float, default=None
+        Low-dimensional sigmoid exponent a. Typically 1-2 for better
+        accommodation of high-D quirks. If None and auto_params=True,
+        estimated based on dimension ratio.
 
-    b_ld : float, default=6.0
-        Low-dimensional sigmoid exponent b.
+    b_ld : float, default=None
+        Low-dimensional sigmoid exponent b. Typically 1-2.
+        If None and auto_params=True, estimated from data.
 
-    auto_histogram : bool, default=True
-        If True, estimate sigma from pairwise-distance histogram.
+    auto_params : bool, default=True
+        If True, automatically estimate sigma, a, and b parameters from
+        the pairwise distance histogram following sketchmap.org guidelines.
 
     mds_opt_steps : int, default=100
         Number of optimization steps with identity transform after classical MDS.
@@ -81,17 +85,37 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
     verbose : int, default=0
         Verbosity level.
+
+    Attributes
+    ----------
+    embedding_ : ndarray of shape (n_samples, n_components)
+        The low-dimensional embedding.
+
+    stress_ : float
+        Final stress value.
+
+    sigma_ : float
+        The sigma parameter used (estimated or provided).
+
+    a_hd_, b_hd_, a_ld_, b_ld_ : float
+        The sigmoid parameters used (estimated or provided).
+
+    gaussian_range_ : float
+        Estimated range of Gaussian fluctuations (short distances to ignore).
+
+    uniform_cutoff_ : float
+        Estimated cutoff where high-D topology dominates (long distances to ignore).
     """
 
     def __init__(
         self,
         n_components=2,
         sigma=None,
-        a_hd=2.0,
-        b_hd=6.0,
-        a_ld=2.0,
-        b_ld=6.0,
-        auto_histogram=True,
+        a_hd=None,
+        b_hd=None,
+        a_ld=None,
+        b_ld=None,
+        auto_params=True,
         mds_opt_steps=100,
         optimizer="L-BFGS-B",
         preopt_steps=100,
@@ -109,7 +133,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         self.b_hd = b_hd
         self.a_ld = a_ld
         self.b_ld = b_ld
-        self.auto_histogram = auto_histogram
+        self.auto_params = auto_params
         self.mds_opt_steps = mds_opt_steps
         self.optimizer = optimizer
         self.preopt_steps = preopt_steps
@@ -157,9 +181,9 @@ class SketchMap(TransformerMixin, BaseEstimator):
         This is used for MDS initialization (like C++ -warp flag).
         """
         # Apply HD sigmoid
-        S_hd = self._sigmoid_transform(D_hd, self.sigma_, self.a_hd, self.b_hd)
+        S_hd = self._sigmoid_transform(D_hd, self.sigma_, self.a_hd_, self.b_hd_)
         # Apply inverse LD sigmoid to get target LD distances
-        D_ld_target = self._sigmoid_inverse(S_hd, self.sigma_, self.a_ld, self.b_ld)
+        D_ld_target = self._sigmoid_inverse(S_hd, self.sigma_, self.a_ld_, self.b_ld_)
         return D_ld_target
 
     def _sigmoid_derivative(self, distances, sigma, a, b):
@@ -207,29 +231,213 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         return coordinates
 
+    def _gaussian_func(self, x, amplitude, center, std_dev):
+        """Gaussian function for curve fitting."""
+        return amplitude * np.exp(-((x - center) ** 2) / (2 * std_dev**2))
+
     def _estimate_sigma(self, distances, n_bins=200):
-        """Estimate sigma from histogram of distances."""
+        """Estimate sigma from pairwise distance histogram.
+
+        Following sketchmap.org guidelines:
+        - sigma should be placed just before the peak of the distance histogram
+        - This ensures that the bulk of pairwise distances (around the peak)
+          are mapped to ~0.5 or higher, preserving their relative ordering
+        - Distances much smaller than sigma → 0 ("close")
+        - Distances much larger than sigma → 1 ("far")
+
+        Parameters
+        ----------
+        distances : ndarray, shape (n_samples, n_samples)
+            Pairwise distance matrix.
+        n_bins : int, default=200
+            Number of bins for histogram.
+
+        Returns
+        -------
+        sigma : float
+            Estimated sigma parameter.
+        """
+        # Analyze distance distribution
+        self._analyze_distance(distances, n_bins=n_bins)
+
+        # Sigma should be placed just before the peak of the distribution
+        # This way, the bulk of distances (around and after the peak) are
+        # in the "transition" region where sigmoid is most sensitive
+        if self.peak_distance_ is not None:
+            # Place sigma slightly before the peak (e.g., 90% of peak distance)
+            # This ensures most distances are mapped above 0.5
+            sigma = 0.9 * self.peak_distance_
+        else:
+            # Fall back to median distance
+            d = distances[np.triu_indices_from(distances, k=1)]
+            sigma = 0.9 * np.median(d[np.isfinite(d) & (d > 0)])
+
+        return sigma
+
+    def _estimate_a_b_params(self, n_features_ld=None):
+        """Estimate a and b parameters for high and low dimensional sigmoids.
+
+        Following sketchmap.org guidelines:
+        - a_hd, b_hd: control how fast sigmoid goes to 0 and 1 in high-D
+        - b_hd should ensure s(x)→1 by the time n(R) becomes very small
+        - a_ld, b_ld: typically smaller (1-2) to accommodate high-D quirks
+        - For dimension equalization: a_ld/d ≈ a_hd/D
+
+        Parameters
+        ----------
+        n_features_ld : int or None
+            Number of low-dimensional components. If None, uses n_components.
+
+        Returns
+        -------
+        params : dict
+            Dictionary with 'a_hd', 'b_hd', 'a_ld', 'b_ld'.
+        """
+        if n_features_ld is None:
+            n_features_ld = self.n_components
+
+        n_features_hd = getattr(self, "n_features_in_", None)
+        if n_features_hd is None:
+            # Default values if dimensionality unknown
+            return {"a_hd": 2.0, "b_hd": 6.0, "a_ld": 2.0, "b_ld": 2.0}
+
+        # High-dimensional parameters
+        # a_hd controls steepness at short range (going to 0)
+        # b_hd controls steepness at long range (going to 1)
+        # b_hd should be large enough that s(x)→1 when n(R) is small
+
+        # Estimate based on the ratio of ranges
+        if (
+            hasattr(self, "gaussian_range_")
+            and hasattr(self, "uniform_cutoff_")
+            and self.gaussian_range_ is not None
+            and self.uniform_cutoff_ is not None
+        ):
+            # The wider the gap between Gaussian range and cutoff,
+            # the sharper we can make the transition
+            range_ratio = self.uniform_cutoff_ / max(self.gaussian_range_, 1e-10)
+            # Typical values: a_hd=2-4, b_hd=4-8
+            a_hd = np.clip(2.0 + np.log(range_ratio), 2.0, 6.0)
+            b_hd = np.clip(a_hd * 2, 4.0, 12.0)
+        else:
+            # Default conservative values
+            a_hd = 2.0
+            b_hd = 6.0
+
+        # Low-dimensional parameters
+        # Rule of thumb from sketchmap.org: a_ld/d ≈ a_hd/D for volume equalization
+        # Typical good starting values: a_ld=1-2, b_ld=1-2
+        if n_features_hd > 0:
+            a_ld = np.clip(a_hd * n_features_ld / n_features_hd, 1.0, 2.0)
+        else:
+            a_ld = 2.0
+        # b_ld is typically smaller than b_hd
+        b_ld = np.clip(a_ld, 1.0, 2.0)
+
+        return {"a_hd": a_hd, "b_hd": b_hd, "a_ld": a_ld, "b_ld": b_ld}
+
+    def _analyze_distance(self, distances, n_bins=200, max_distance=None):
+        """Analyze pairwise distance distribution.
+
+        Following sketchmap.org analysis:
+        1. Histogram shows low probability at very short distances (high-D effect)
+        2. Peak/shoulder at Gaussian fluctuation scale (~std*sqrt(D/d))
+        3. Long-range part dominated by high-D topology (similar to uniform)
+
+        Parameters
+        ----------
+        distances : ndarray, shape (n_samples, n_samples)
+            Pairwise distance matrix.
+        n_bins : int, default=200
+            Number of bins for histogram.
+        max_distance : float or None, default=None
+            Maximum distance for histogram. If None, uses 99.9th percentile.
+        """
+        # Extract upper triangle (pairwise distances without diagonal)
         d = distances[np.triu_indices_from(distances, k=1)]
         d = d[np.isfinite(d) & (d >= 0)]
 
         if d.size == 0:
             raise ValueError("Empty distances array")
 
-        hist, edges = np.histogram(d, bins=n_bins)
-        peak_idx = np.argmax(hist)
-        peak_val = hist[peak_idx]
+        self.distances_ = d
 
-        # Find where histogram drops below half peak
-        half_idx = np.where(hist[peak_idx + 1 :] <= peak_val * 0.5)[0]
+        if max_distance is None:
+            max_distance = np.percentile(d, 99.9)
+        self.max_distance_ = max_distance
 
-        if half_idx.size > 0:
-            sigma = 0.5 * (
-                edges[peak_idx + 1 + half_idx[0]] + edges[peak_idx + half_idx[0]]
-            )
-        else:
-            sigma = float(np.median(d))
+        # Create histogram (probability density n(R))
+        self.bin_edges_ = np.linspace(0, self.max_distance_, n_bins + 1)
+        bin_counts, _ = np.histogram(d, bins=self.bin_edges_, density=True)
 
-        return sigma
+        self.prob_density_ = bin_counts
+
+        right_edges = self.bin_edges_[1:]
+        left_edges = self.bin_edges_[:-1]
+        self.bin_centers_ = 0.5 * (left_edges + right_edges)
+
+        # Find the peak of the distribution
+        peak_id = np.argmax(bin_counts)
+        self.peak_distance_ = self.bin_centers_[peak_id]
+
+        # Initialize attributes
+        self.gaussian_std_ = None
+        self.gaussian_range_ = None
+        self.uniform_cutoff_ = None
+
+        # === Estimate Gaussian fluctuation range ===
+        # The left side of the peak (short distances) reflects Gaussian correlations
+        # Fit a Gaussian to estimate the standard deviation
+        left_mask = self.bin_centers_ <= self.peak_distance_
+        if np.sum(left_mask) > 3:
+            try:
+                initial_guess = [np.max(bin_counts), self.peak_distance_, 1.0]
+                optimal_params, _ = curve_fit(
+                    self._gaussian_func,
+                    self.bin_centers_[left_mask],
+                    bin_counts[left_mask],
+                    p0=initial_guess,
+                    maxfev=5000,
+                )
+                _amplitude, _center, std_dev = optimal_params
+                self.gaussian_std_ = abs(std_dev)
+                # Gaussian range: ~3 std deviations from peak encompasses most
+                # of the Gaussian fluctuations (these distances are "too close")
+                self.gaussian_range_ = self.peak_distance_ + 3 * self.gaussian_std_
+            except (RuntimeError, ValueError):
+                # Curve fitting failed, estimate from peak position
+                self.gaussian_std_ = self.peak_distance_ / 3.0
+                self.gaussian_range_ = self.peak_distance_ * 2.0
+
+        # === Estimate uniform/high-D dominated cutoff ===
+        # The right tail of the distribution becomes dominated by high-D topology
+        # Find where n(R) drops significantly (these distances are "too far")
+        right_mask = self.bin_centers_ > self.peak_distance_
+        right_bins = self.bin_centers_[right_mask]
+        right_counts = bin_counts[right_mask]
+
+        if len(right_counts) > 3:
+            # Find where the density drops to a small fraction of the peak
+            peak_density = bin_counts[peak_id]
+            threshold = 0.1 * peak_density  # 10% of peak density
+
+            # Find the distance where density drops below threshold
+            below_threshold = right_counts < threshold
+            if np.any(below_threshold):
+                first_below = np.argmax(below_threshold)
+                self.uniform_cutoff_ = right_bins[first_below]
+            else:
+                # If never drops below, use the 90th percentile of distances
+                self.uniform_cutoff_ = np.percentile(d, 90)
+
+        # Ensure gaussian_range < uniform_cutoff
+        if self.gaussian_range_ is not None and self.uniform_cutoff_ is not None:
+            if self.gaussian_range_ >= self.uniform_cutoff_:
+                # Adjust: place gaussian_range at 1/3 and cutoff at 2/3 of range
+                range_span = self.max_distance_
+                self.gaussian_range_ = self.peak_distance_ + 0.2 * range_span
+                self.uniform_cutoff_ = self.peak_distance_ + 0.6 * range_span
+
 
     def _compute_stress(
         self, X_ld, D_hd, S_hd, W, tw, mixing_ratio, use_transform=True
@@ -265,7 +473,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         # Transform low-dimensional distances if requested
         if use_transform:
-            S_ld = self._sigmoid_transform(D_ld, self.sigma_, self.a_ld, self.b_ld)
+            S_ld = self._sigmoid_transform(D_ld, self.sigma_, self.a_ld_, self.b_ld_)
         else:
             S_ld = D_ld
 
@@ -312,8 +520,8 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         # Transform and derivatives
         if use_transform:
-            S_ld = self._sigmoid_transform(D_ld, self.sigma_, self.a_ld, self.b_ld)
-            dS_dD = self._sigmoid_derivative(D_ld, self.sigma_, self.a_ld, self.b_ld)
+            S_ld = self._sigmoid_transform(D_ld, self.sigma_, self.a_ld_, self.b_ld_)
+            dS_dD = self._sigmoid_derivative(D_ld, self.sigma_, self.a_ld_, self.b_ld_)
         else:
             S_ld = D_ld
             dS_dD = np.ones_like(D_ld)
@@ -555,16 +763,38 @@ class SketchMap(TransformerMixin, BaseEstimator):
             print("Computing pairwise distances...")
         D_hd = squareform(pdist(X_work, metric="euclidean"))
 
-        # Estimate or set sigma
-        if self.auto_histogram and self.sigma is None:
+        # Estimate or set sigmoid parameters (sigma, a, b)
+        # Following sketchmap.org guidelines for parameter selection
+        if self.auto_params and self.sigma is None:
             self.sigma_ = self._estimate_sigma(D_hd)
             if self.verbose:
                 print(f"Estimated sigma: {self.sigma_:.4f}")
+                if hasattr(self, "gaussian_range_") and self.gaussian_range_ is not None:
+                    print(f"  Gaussian range (short-range cutoff): {self.gaussian_range_:.4f}")
+                if hasattr(self, "uniform_cutoff_") and self.uniform_cutoff_ is not None:
+                    print(f"  Uniform cutoff (long-range cutoff): {self.uniform_cutoff_:.4f}")
         else:
             self.sigma_ = self.sigma if self.sigma is not None else 1.0
 
+        # Estimate or set a/b parameters
+        if self.auto_params:
+            auto_ab = self._estimate_a_b_params()
+            self.a_hd_ = self.a_hd if self.a_hd is not None else auto_ab["a_hd"]
+            self.b_hd_ = self.b_hd if self.b_hd is not None else auto_ab["b_hd"]
+            self.a_ld_ = self.a_ld if self.a_ld is not None else auto_ab["a_ld"]
+            self.b_ld_ = self.b_ld if self.b_ld is not None else auto_ab["b_ld"]
+            if self.verbose:
+                print(f"Sigmoid parameters: a_hd={self.a_hd_:.2f}, b_hd={self.b_hd_:.2f}, "
+                      f"a_ld={self.a_ld_:.2f}, b_ld={self.b_ld_:.2f}")
+        else:
+            # Use provided values or defaults
+            self.a_hd_ = self.a_hd if self.a_hd is not None else 2.0
+            self.b_hd_ = self.b_hd if self.b_hd is not None else 6.0
+            self.a_ld_ = self.a_ld if self.a_ld is not None else 2.0
+            self.b_ld_ = self.b_ld if self.b_ld is not None else 6.0
+
         # Transform high-dimensional distances (for stage 2)
-        S_hd = self._sigmoid_transform(D_hd, self.sigma_, self.a_hd, self.b_hd)
+        S_hd = self._sigmoid_transform(D_hd, self.sigma_, self.a_hd_, self.b_hd_)
 
         # Setup weight matrix: W_ij = w_i * w_j (like C++)
         if sample_weights is not None:
