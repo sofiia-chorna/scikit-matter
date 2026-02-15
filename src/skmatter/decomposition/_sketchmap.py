@@ -62,7 +62,7 @@ def sigmoid_transform(distances, sigma, a, b):
         A = 2 ** (a / b) - 1.0
 
         # Compute sigmoid: s(r) = 1 - (1 + A * (r/sigma)^a)^(-b/a)
-        term = A * (r_normalized ** a)
+        term = A * (r_normalized**a)
         transformed = 1.0 - (1.0 + term) ** (-b / a)
 
         # Handle edge case: r = 0 should map to s = 0
@@ -135,7 +135,7 @@ def sigmoid_derivative(distances, sigma, a, b):
     if np.any(positive_mask):
         r = distances[positive_mask]
         u = A * (r / sigma) ** a
-        prefactor = b * A * (r ** (a - 1.0)) / (sigma ** a)
+        prefactor = b * A * (r ** (a - 1.0)) / (sigma**a)
         derivative[positive_mask] = prefactor * (1.0 + u) ** (-b / a - 1.0)
 
     return derivative
@@ -161,7 +161,7 @@ def classical_mds(distances, n_components):
     """
     # Compute Gram matrix with double centering: B = -0.5 * H @ D^2 @ H
     # where H = I - 1/n * ones is the centering matrix
-    gram_matrix = -0.5 * (distances ** 2)
+    gram_matrix = -0.5 * (distances**2)
     gram_matrix -= gram_matrix.mean(axis=0, keepdims=True)  # Center columns
     gram_matrix -= gram_matrix.mean(axis=1, keepdims=True)  # Center rows
 
@@ -187,7 +187,7 @@ def classical_mds(distances, n_components):
 
 def _gaussian(x, amplitude, center, std_dev):
     """Gaussian function for curve fitting."""
-    return amplitude * np.exp(-((x - center) ** 2) / (2 * std_dev ** 2))
+    return amplitude * np.exp(-((x - center) ** 2) / (2 * std_dev**2))
 
 
 def analyze_distance_distribution(distances, n_bins=200):
@@ -284,7 +284,10 @@ def analyze_distance_distribution(distances, n_bins=200):
             analysis["uniform_cutoff"] = np.percentile(d, 90)
 
     # Ensure gaussian_range < uniform_cutoff
-    if analysis["gaussian_range"] is not None and analysis["uniform_cutoff"] is not None:
+    if (
+        analysis["gaussian_range"] is not None
+        and analysis["uniform_cutoff"] is not None
+    ):
         if analysis["gaussian_range"] >= analysis["uniform_cutoff"]:
             analysis["gaussian_range"] = peak_distance + 0.2 * max_distance
             analysis["uniform_cutoff"] = peak_distance + 0.6 * max_distance
@@ -327,9 +330,14 @@ def suggest_sigmoid_params(distances, n_components, n_features, n_bins=200):
     sigma = 0.9 * analysis["peak_distance"]
 
     # === Estimate a_hd, b_hd (high-dimensional sigmoid) ===
-    if analysis["gaussian_range"] is not None and analysis["uniform_cutoff"] is not None:
+    if (
+        analysis["gaussian_range"] is not None
+        and analysis["uniform_cutoff"] is not None
+    ):
         # Sharper transition for wider informative range
-        range_ratio = analysis["uniform_cutoff"] / max(analysis["gaussian_range"], 1e-10)
+        range_ratio = analysis["uniform_cutoff"] / max(
+            analysis["gaussian_range"], 1e-10
+        )
         a_hd = np.clip(2.0 + np.log(range_ratio), 2.0, 6.0)
         b_hd = np.clip(a_hd * 2, 4.0, 12.0)
     else:
@@ -483,8 +491,14 @@ class SketchMap(TransformerMixin, BaseEstimator):
         self.verbose = verbose
 
     def _compute_stress(
-        self, embedding, hd_distances, hd_transformed, weights, total_weight,
-        mixing_ratio, use_transform=True
+        self,
+        embedding,
+        hd_distances,
+        hd_transformed,
+        weights,
+        total_weight,
+        mixing_ratio,
+        use_transform=True,
     ):
         """Compute the sketch-map stress function.
 
@@ -540,17 +554,21 @@ class SketchMap(TransformerMixin, BaseEstimator):
         weights_triu = weights[triu_idx]
 
         stress = np.sum(
-            weights_triu * (
-                (1.0 - mixing_ratio) * diff_transformed +
-                mixing_ratio * diff_direct
-            )
+            weights_triu
+            * ((1.0 - mixing_ratio) * diff_transformed + mixing_ratio * diff_direct)
         )
 
         return stress / total_weight
 
     def _compute_gradient(
-        self, embedding, hd_distances, hd_transformed, weights, total_weight,
-        mixing_ratio, use_transform=True
+        self,
+        embedding,
+        hd_distances,
+        hd_transformed,
+        weights,
+        total_weight,
+        mixing_ratio,
+        use_transform=True,
     ):
         """Compute gradient of the stress function.
 
@@ -583,7 +601,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         # Compute pairwise differences and distances
         diff_vectors = embedding[:, None, :] - embedding[None, :, :]
-        ld_distances = np.sqrt(np.sum(diff_vectors ** 2, axis=2))
+        ld_distances = np.sqrt(np.sum(diff_vectors**2, axis=2))
 
         # Transform and derivatives
         if use_transform:
@@ -612,10 +630,14 @@ class SketchMap(TransformerMixin, BaseEstimator):
             eps = 1e-100
             inv_distance = 1.0 / np.maximum(ld_distances, eps)
             coefficients = (
-                weights * (
-                    (1.0 - mixing_ratio) * (hd_transformed - ld_transformed) * ld_derivative +
-                    mixing_ratio * (hd_distances - ld_distances)
-                ) * inv_distance
+                weights
+                * (
+                    (1.0 - mixing_ratio)
+                    * (hd_transformed - ld_transformed)
+                    * ld_derivative
+                    + mixing_ratio * (hd_distances - ld_distances)
+                )
+                * inv_distance
             )
 
         np.fill_diagonal(coefficients, 0.0)
@@ -628,8 +650,15 @@ class SketchMap(TransformerMixin, BaseEstimator):
         return gradient.ravel()
 
     def _optimize(
-        self, initial_embedding, hd_distances, hd_transformed, weights,
-        total_weight, mixing_ratio, n_steps, use_transform=True
+        self,
+        initial_embedding,
+        hd_distances,
+        hd_transformed,
+        weights,
+        total_weight,
+        mixing_ratio,
+        n_steps,
+        use_transform=True,
     ):
         """Run optimization to minimize stress.
 
@@ -664,27 +693,33 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         def objective(x):
             return self._compute_stress(
-                x, hd_distances, hd_transformed, weights, total_weight,
-                mixing_ratio, use_transform
+                x,
+                hd_distances,
+                hd_transformed,
+                weights,
+                total_weight,
+                mixing_ratio,
+                use_transform,
             )
 
         def gradient(x):
             return self._compute_gradient(
-                x, hd_distances, hd_transformed, weights, total_weight,
-                mixing_ratio, use_transform
+                x,
+                hd_distances,
+                hd_transformed,
+                weights,
+                total_weight,
+                mixing_ratio,
+                use_transform,
             )
 
-        # Run optimization
-        if self.optimizer == "CG":
-            result = minimize(
-                objective, x0, method="CG", jac=gradient,
-                options={"maxiter": n_steps, "disp": False, "gtol": 1e-8}
-            )
-        else:
-            result = minimize(
-                objective, x0, method="L-BFGS-B", jac=gradient,
-                options={"maxiter": n_steps, "disp": False, "gtol": 1e-8}
-            )
+        result = minimize(
+            objective,
+            x0,
+            method=self.optimizer,
+            jac=gradient,
+            options={"maxiter": n_steps, "disp": False, "gtol": 1e-8},
+        )
 
         if self.verbose:
             print(f"  Optimization finished: stress = {result.fun:.6f}")
@@ -693,8 +728,13 @@ class SketchMap(TransformerMixin, BaseEstimator):
         return optimized_embedding, result.fun
 
     def _global_optimize(
-        self, embedding, hd_distances, hd_transformed, weights, total_weight,
-        n_iterations
+        self,
+        embedding,
+        hd_distances,
+        hd_transformed,
+        weights,
+        total_weight,
+        n_iterations,
     ):
         """Global optimization using basin hopping.
 
@@ -725,14 +765,24 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         def objective(x):
             return self._compute_stress(
-                x, hd_distances, hd_transformed, weights, total_weight,
-                self.mixing_ratio, use_transform=True
+                x,
+                hd_distances,
+                hd_transformed,
+                weights,
+                total_weight,
+                self.mixing_ratio,
+                use_transform=True,
             )
 
         def gradient(x):
             return self._compute_gradient(
-                x, hd_distances, hd_transformed, weights, total_weight,
-                self.mixing_ratio, use_transform=True
+                x,
+                hd_distances,
+                hd_transformed,
+                weights,
+                total_weight,
+                self.mixing_ratio,
+                use_transform=True,
             )
 
         minimizer_kwargs = {
@@ -759,7 +809,9 @@ class SketchMap(TransformerMixin, BaseEstimator):
         take_step = RandomDisplacement(stepsize=scale * 0.5, rng=rng)
 
         result = basinhopping(
-            objective, x0, niter=n_iterations,
+            objective,
+            x0,
+            niter=n_iterations,
             minimizer_kwargs=minimizer_kwargs,
             take_step=take_step,
             seed=int(rng.integers(0, 2**31)) if self.random_state else None,
@@ -848,8 +900,12 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         if self.verbose:
             print(f"  sigma = {self.params_['sigma']:.4f}")
-            print(f"  a_hd = {self.params_['a_hd']:.2f}, b_hd = {self.params_['b_hd']:.2f}")
-            print(f"  a_ld = {self.params_['a_ld']:.2f}, b_ld = {self.params_['b_ld']:.2f}")
+            print(
+                f"  a_hd = {self.params_['a_hd']:.2f}, b_hd = {self.params_['b_hd']:.2f}"
+            )
+            print(
+                f"  a_ld = {self.params_['a_ld']:.2f}, b_ld = {self.params_['b_ld']:.2f}"
+            )
             print(f"  (peak distance = {analysis['peak_distance']:.4f})")
 
         # -----------------------------------------------------------------
@@ -898,11 +954,16 @@ class SketchMap(TransformerMixin, BaseEstimator):
         # -----------------------------------------------------------------
         if self.mds_opt_steps > 0 and self.init is None:
             if self.verbose:
-                print(f"\n=== Stage 0: MDS optimization ({self.mds_opt_steps} steps) ===")
+                print(
+                    f"\n=== Stage 0: MDS optimization ({self.mds_opt_steps} steps) ==="
+                )
 
             embedding, mds_stress = self._optimize(
-                embedding, hd_distances, hd_distances,  # No transform
-                weights, total_weight,
+                embedding,
+                hd_distances,
+                hd_distances,  # No transform
+                weights,
+                total_weight,
                 mixing_ratio=1.0,  # Pure distance stress
                 n_steps=self.mds_opt_steps,
                 use_transform=False,
@@ -917,12 +978,18 @@ class SketchMap(TransformerMixin, BaseEstimator):
         stress = 0.0
         if self.preopt_steps > 0:
             if self.verbose:
-                print(f"\n=== Stage 1: Pre-optimization ({self.preopt_steps} steps) ===")
+                print(
+                    f"\n=== Stage 1: Pre-optimization ({self.preopt_steps} steps) ==="
+                )
 
             embedding, stress = self._optimize(
-                embedding, hd_distances, hd_transformed,
-                weights, total_weight,
-                self.mixing_ratio, self.preopt_steps,
+                embedding,
+                hd_distances,
+                hd_transformed,
+                weights,
+                total_weight,
+                self.mixing_ratio,
+                self.preopt_steps,
                 use_transform=True,
             )
 
@@ -934,11 +1001,17 @@ class SketchMap(TransformerMixin, BaseEstimator):
         # -----------------------------------------------------------------
         if self.global_opt is not None:
             if not isinstance(self.global_opt, int) or self.global_opt < 1:
-                raise ValueError(f"global_opt must be positive int, got {self.global_opt}")
+                raise ValueError(
+                    f"global_opt must be positive int, got {self.global_opt}"
+                )
 
             embedding, stress = self._global_optimize(
-                embedding, hd_distances, hd_transformed,
-                weights, total_weight, self.global_opt
+                embedding,
+                hd_distances,
+                hd_transformed,
+                weights,
+                total_weight,
+                self.global_opt,
             )
 
         # -----------------------------------------------------------------
@@ -949,9 +1022,13 @@ class SketchMap(TransformerMixin, BaseEstimator):
                 print(f"\n=== Stage 2: Main optimization ({self.max_iter} steps) ===")
 
             embedding, stress = self._optimize(
-                embedding, hd_distances, hd_transformed,
-                weights, total_weight,
-                self.mixing_ratio, self.max_iter,
+                embedding,
+                hd_distances,
+                hd_transformed,
+                weights,
+                total_weight,
+                self.mixing_ratio,
+                self.max_iter,
                 use_transform=True,
             )
 

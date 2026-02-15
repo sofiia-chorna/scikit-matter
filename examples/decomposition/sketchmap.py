@@ -59,11 +59,11 @@ print(f"Weights: min={weights.min():.4f}, max={weights.max():.4f}")
 
 sm = SketchMap(
     n_components=2,
-    params={"sigma": 7.0, "a_hd": 4.0, "b_hd": 2.0, "a_ld": 2.0, "b_ld": 2.0 },
+    params={"sigma": 7.0, "a_hd": 4.0, "b_hd": 2.0, "a_ld": 2.0, "b_ld": 2.0},
     optimizer="L-BFGS-B",
     mixing_ratio=0.0,
     verbose=True,
-    global_opt=1
+    global_opt=1,
 )
 sm.fit(X_land, sample_weights=weights)
 T = sm.embedding_
@@ -77,7 +77,7 @@ print(f"\nPython final stress (from MDS init): {sm.stress_:.6f}")
 # Note: C++ uses Polak-Ribière CG optimizer, which converges to a slightly
 # different local minimum than L-BFGS-B. Both produce valid embeddings.
 
-#T_cpp = np.loadtxt("lowd.gmds_10", skiprows=5)[:, :2]
+# T_cpp = np.loadtxt("lowd.gmds_10", skiprows=5)[:, :2]
 T_cpp = np.loadtxt("low_landmarks.dat")[:, :2]
 
 # Compute stress of C++ embedding using Python implementation
@@ -97,10 +97,14 @@ cpp_stress_recomputed = sm._compute_stress(
 print("\nC++ stress (recomputed by Python): {:.6f}".format(cpp_stress_recomputed))
 print(f"Python stress (from MDS init): {sm.stress_:.6f}")
 
-print(f"\nPython embedding range: x=[{T[:,0].min():.2f}, {T[:,0].max():.2f}], "
-      f"y=[{T[:,1].min():.2f}, {T[:,1].max():.2f}]")
-print(f"C++ embedding range: x=[{T_cpp[:,0].min():.2f}, {T_cpp[:,0].max():.2f}], "
-      f"y=[{T_cpp[:,1].min():.2f}, {T_cpp[:,1].max():.2f}]")
+print(
+    f"\nPython embedding range: x=[{T[:,0].min():.2f}, {T[:,0].max():.2f}], "
+    f"y=[{T[:,1].min():.2f}, {T[:,1].max():.2f}]"
+)
+print(
+    f"C++ embedding range: x=[{T_cpp[:,0].min():.2f}, {T_cpp[:,0].max():.2f}], "
+    f"y=[{T_cpp[:,1].min():.2f}, {T_cpp[:,1].max():.2f}]"
+)
 
 
 # %%
