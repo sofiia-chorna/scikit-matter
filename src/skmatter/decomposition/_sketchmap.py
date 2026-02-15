@@ -1,11 +1,6 @@
 """
 Sketch-Map dimensionality reduction.
 
-This module implements the Sketch-Map algorithm for nonlinear dimensionality
-reduction, which uses sigmoid transformations to focus on intermediate-range
-distances while ignoring very short (Gaussian fluctuations) and very long
-(high-dimensional topology) distances.
-
 References
 ----------
 .. [1] Ceriotti, M., Tribello, G. A., & Parrinello, M. (2011).
@@ -400,7 +395,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         applying sigmoid. Set to 0 to skip.
 
     optimizer : str, default="L-BFGS-B"
-        Optimization method: "L-BFGS-B" (fast) or "CG" (matches C++).
+        Optimization method: "L-BFGS-B" or "CG".
 
     preopt_steps : int, default=100
         Number of pre-optimization steps with sigmoid transform.
@@ -408,7 +403,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
     max_iter : int, default=1000
         Number of main optimization steps with sigmoid transform.
 
-    global_opt : int or None, default=None
+    global_opt_steps : int or None, default=None
         Number of basin-hopping iterations for global optimization.
         Set to None to disable.
 
@@ -470,7 +465,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         optimizer="L-BFGS-B",
         preopt_steps=100,
         max_iter=1000,
-        global_opt=None,
+        global_opt_steps=None,
         mixing_ratio=0.0,
         center=True,
         init=None,
@@ -483,7 +478,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         self.optimizer = optimizer
         self.preopt_steps = preopt_steps
         self.max_iter = max_iter
-        self.global_opt = global_opt
+        self.global_opt_steps = global_opt_steps
         self.mixing_ratio = mixing_ratio
         self.center = center
         self.init = init
@@ -997,24 +992,6 @@ class SketchMap(TransformerMixin, BaseEstimator):
                 print(f"Pre-optimization stress: {stress:.6f}")
 
         # -----------------------------------------------------------------
-        # Step 8: Global optimization (optional)
-        # -----------------------------------------------------------------
-        if self.global_opt is not None:
-            if not isinstance(self.global_opt, int) or self.global_opt < 1:
-                raise ValueError(
-                    f"global_opt must be positive int, got {self.global_opt}"
-                )
-
-            embedding, stress = self._global_optimize(
-                embedding,
-                hd_distances,
-                hd_transformed,
-                weights,
-                total_weight,
-                self.global_opt,
-            )
-
-        # -----------------------------------------------------------------
         # Step 9: Main optimization
         # -----------------------------------------------------------------
         if self.max_iter > 0:
@@ -1034,6 +1011,24 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
             if self.verbose:
                 print(f"Final stress: {stress:.6f}")
+
+        # -----------------------------------------------------------------
+        # Step 8: Global optimization (optional)
+        # -----------------------------------------------------------------
+        if self.global_opt_steps is not None:
+            if not isinstance(self.global_opt_steps, int) or self.global_opt_steps < 1:
+                raise ValueError(
+                    f"global_opt_steps must be positive int, got {self.global_opt_steps}"
+                )
+
+            embedding, stress = self._global_optimize(
+                embedding,
+                hd_distances,
+                hd_transformed,
+                weights,
+                total_weight,
+                self.global_opt_steps,
+            )
 
         self.embedding_ = embedding
         self.stress_ = stress
