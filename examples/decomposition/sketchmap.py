@@ -44,7 +44,7 @@ axes[0].set_ylabel("Z")
 
 # SketchMap embedding
 sc = axes[1].scatter(embedding[:, 0], embedding[:, 1], c=color, cmap="viridis", s=20)
-axes[1].set_title(f"SketchMap Embedding (stress={sm.stress_:.4f})")
+axes[1].set_title("SketchMap embedding")
 axes[1].set_xlabel("Dimension 1")
 axes[1].set_ylabel("Dimension 2")
 
@@ -82,8 +82,6 @@ sm_py = SketchMap(
 )
 lowd_py = sm_py.fit_transform(X_hd, sample_weights=weights)
 
-print(f"\nPython stress: {sm_py.stress_:.6f}")
-
 # Plot comparison
 
 fig, axes = plt.subplots(1, 2, figsize=(10, 5))
@@ -92,7 +90,7 @@ fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 axes[0].scatter(
     lowd_py[:, 0], lowd_py[:, 1], c=weights, cmap="viridis", s=20, edgecolor="k", lw=0.3
 )
-axes[0].set_title(f"Python SketchMap\n(stress={sm_py.stress_:.4f})")
+axes[0].set_title("Python SketchMap")
 axes[0].set_xlabel("Dimension 1")
 axes[0].set_ylabel("Dimension 2")
 

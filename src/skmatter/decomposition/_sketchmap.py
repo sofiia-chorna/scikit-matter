@@ -1,11 +1,24 @@
 """
-Sketch-Map dimensionality reduction.
+Sketch-Map: Nonlinear dimensionality reduction
+
+Sketch-Map is a nonlinear dimensionality reduction technique. Unlike linear methods
+(PCA) or neighborhood-based methods (t-SNE, UMAP), Sketch-Map uses sigmoid functions to
+selectively focus on "intermediate-range" pairwise distances while filtering out noise
+from both extremes.
+
+The key insight is that in high-dimensional data very short distances often represent
+thermal fluctuations or noise that should not influence the global structure, very long
+distances are unreliable due to the "curse of dimensionality" where all points appear
+roughly equidistant in high dimensions. Intermediate distances contain the meaningful
+structural information we want to preserve in the low-dimensional embedding.
+
+The sigmoid transformation compresses both extremes toward 0 and 1, effectively creating
+a "sketch" of the distance relationships that emphasizes the informative middle range.
 
 References
 ----------
-.. [1] Ceriotti, M., Tribello, G. A., & Parrinello, M. (2011).
-       Simplifying the representation of complex free-energy landscapes
-       using sketch-map. PNAS, 108(32), 13023-13028.
+See Ceriotti et al. [Ceriotti2011]_, which introduces Sketch-Map, and the follow-up
+[Ceriotti2013]_.
 """
 
 import warnings
@@ -18,58 +31,61 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted, validate_data
 
 
-# ================
-# Helper functions
-# ================
+# Sigmoid transformation functions
 
 
 def sigmoid_transform(distances, sigma, a, b):
-    """Apply the sketch-map sigmoid transformation to distances.
+    """Apply the Sketch-Map sigmoid transformation to distances.
 
-    The sigmoid function is: s(r) = 1 - (1 + (2^(a/b) - 1) * (r/sigma)^a)^(-b/a)
+    The sigmoid function maps pairwise distances to the range [0, 1], with
+    the switching point at r = sigma (where s(sigma) = 0.5).
 
-    This function maps:
-    - r => 0  when r << sigma  (close points)
-    - r => 1  when r >> sigma  (far points)
-    - r = sigma  maps to 0.5  (switching distance)
+    The transformation effectively "compresses" both very small and very large
+    distances, focusing the optimization on intermediate-range structure.
+
+    Mathematical form::
+
+        s(r) = 1 - (1 + A * (r/sigma)^a)^(-b/a)
+
+    where A = 2^(a/b) - 1 ensures s(sigma) = 0.5.
 
     Parameters
     ----------
     distances : ndarray
         Pairwise distances to transform.
     sigma : float
-        Switching distance where s(sigma) = 0.5.
+        Switching distance where s(sigma) = 0.5. This is the "characteristic scale" of
+        the transformation.
     a : float
-        Controls steepness at short range (how fast s→0 for r << sigma).
+        Short-range steepness parameter. Larger values make the sigmoid steeper for
+        distances below sigma.
     b : float
-        Controls steepness at long range (how fast s→1 for r >> sigma).
-
-    Returns
-    -------
-    transformed : ndarray
-        Sigmoid-transformed distances in [0, 1].
+        Long-range steepness parameter. Larger values make the sigmoid steeper for
+        distances above sigma.
     """
     with np.errstate(divide="ignore", invalid="ignore"):
-        # Normalized distance
+        # Normalize distances by the switching distance
         r_normalized = distances / sigma
 
-        # Sigmoid coefficient: A = 2^(a/b) - 1
+        # Sigmoid coefficient ensuring s(sigma) = 0.5
         A = 2 ** (a / b) - 1.0
 
-        # Compute sigmoid: s(r) = 1 - (1 + A * (r/sigma)^a)^(-b/a)
+        # Compute sigmoid transformation
         term = A * (r_normalized**a)
         transformed = 1.0 - (1.0 + term) ** (-b / a)
 
-        # Handle edge case: r = 0 should map to s = 0
+        # Handle edge case: zero distance should map to zero
         transformed[distances <= 0.0] = 0.0
 
     return transformed
 
 
 def sigmoid_inverse(y, sigma, a, b):
-    """Inverse of the sigmoid transformation.
+    """Compute the inverse of the sigmoid transformation.
 
-    Maps transformed distance y back to raw distance r.
+    Maps a transformed distance value back to the original distance. This function is
+    useful for interpreting transformed distances in terms of the original distance
+    scale.
 
     Parameters
     ----------
@@ -81,21 +97,16 @@ def sigmoid_inverse(y, sigma, a, b):
         Short-range steepness parameter.
     b : float
         Long-range steepness parameter.
-
-    Returns
-    -------
-    distances : ndarray
-        Raw distances corresponding to transformed values.
     """
     with np.errstate(divide="ignore", invalid="ignore"):
         A = 2 ** (a / b) - 1.0
 
-        # Inverse formula: r = sigma * (((1-y)^(-a/b) - 1) / A)^(1/a)
+        # Inverse formula derived by solving s(r) = y for r
         one_minus_y = np.maximum(1.0 - y, 1e-12)
         inner = np.power(one_minus_y, -a / b) - 1.0
         distances = sigma * np.power(np.maximum(inner / A, 0.0), 1.0 / a)
 
-        # Handle edge cases
+        # Handle boundary cases
         distances[y <= 0.0] = 0.0
         distances[y >= 1.0] = np.inf
 
@@ -103,9 +114,10 @@ def sigmoid_inverse(y, sigma, a, b):
 
 
 def sigmoid_derivative(distances, sigma, a, b):
-    """Compute derivative of sigmoid with respect to distance.
+    """Compute the derivative of the sigmoid with respect to distance.
 
-    Used for gradient computation in optimization.
+    This derivative is required for gradient-based optimization of the Sketch-Map stress
+    function.
 
     Parameters
     ----------
@@ -121,12 +133,14 @@ def sigmoid_derivative(distances, sigma, a, b):
     Returns
     -------
     derivative : ndarray
-        ds/dr at each distance.
+        The value ds/dr at each distance point.
     """
     A = 2 ** (a / b) - 1.0
     derivative = np.zeros_like(distances, dtype=float)
 
+    # Only compute for positive distances (derivative at r=0 is 0)
     positive_mask = distances > 0.0
+
     if np.any(positive_mask):
         r = distances[positive_mask]
         u = A * (r / sigma) ** a
@@ -136,42 +150,39 @@ def sigmoid_derivative(distances, sigma, a, b):
     return derivative
 
 
-def classical_mds(distances, n_components):
-    """Classical MDS initialization.
+# Utility functions
 
-    Computes an initial embedding using eigendecomposition of the
-    double-centered distance matrix.
+
+def classical_mds(distances, n_components):
+    """Compute a classical MDS embedding as initialization.
+
+    Classical MDS finds coordinates that best reproduce the given distance matrix using
+    eigendecomposition of the doubly-centered Gram matrix.
 
     Parameters
     ----------
-    distances : ndarray, shape (n_samples, n_samples)
-        Pairwise distance matrix.
+    distances : ndarray of shape (n_samples, n_samples)
+        Symmetric pairwise distance matrix.
     n_components : int
         Number of dimensions for the embedding.
-
-    Returns
-    -------
-    coordinates : ndarray, shape (n_samples, n_components)
-        Initial embedding coordinates.
     """
-    # Compute Gram matrix with double centering: B = -0.5 * H @ D^2 @ H
-    # where H = I - 1/n * ones is the centering matrix
+    # Double-centering to obtain the Gram matrix
     gram_matrix = -0.5 * (distances**2)
     gram_matrix -= gram_matrix.mean(axis=0, keepdims=True)  # Center columns
     gram_matrix -= gram_matrix.mean(axis=1, keepdims=True)  # Center rows
 
-    # Eigendecomposition
+    # Eigendecomposition (eigh returns sorted in ascending order)
     eigenvalues, eigenvectors = np.linalg.eigh(gram_matrix)
 
-    # Take top n_components (largest eigenvalues)
+    # Select top n_components (largest eigenvalues)
     top_indices = np.argsort(eigenvalues)[::-1][:n_components]
     top_eigenvalues = eigenvalues[top_indices]
     top_eigenvectors = eigenvectors[:, top_indices]
 
-    # Compute coordinates
+    # Compute coordinates: X = V @ sqrt(lambda)
     coordinates = top_eigenvectors * np.sqrt(np.maximum(top_eigenvalues, 0.0))
 
-    # Consistent sign convention
+    # Apply consistent sign convention
     for i in range(n_components):
         col = coordinates[:, i]
         if col[np.argmax(np.abs(col))] < 0:
@@ -181,53 +192,50 @@ def classical_mds(distances, n_components):
 
 
 def _gaussian(x, amplitude, center, std_dev):
-    """Gaussian function for curve fitting."""
+    """Gaussian function for curve fitting in distance distribution analysis."""
     return amplitude * np.exp(-((x - center) ** 2) / (2 * std_dev**2))
 
 
-def analyze_distance_distribution(distances, n_bins=200):
-    """Analyze the distribution of pairwise distances.
+# Distance distribution analysis
 
-    This function computes a histogram of distances and identifies:
-    1. Peak distance: where the bulk of pairwise distances lie
-    2. Gaussian range: short-range fluctuations (to be ignored)
-    3. Uniform cutoff: where high-D topology dominates (to be ignored)
+
+def analyze_distance_distribution(distances, n_bins=200):
+    """Analyze the distribution of pairwise distances for parameter estimation.
+
+    This function computes a histogram of the pairwise distances and identifies key
+    features that inform the choice of sigmoid parameters. 1. Peak distance (where the
+    bulk of pairwise distances lie, this represents the characteristic scale of the
+    data.) 2. Gaussian range (the regime dominated by short-range fluctuations,
+    distances below this should be compressed). 3. Uniform cutoff (where the
+    high-dimensional "curse of dimensionality" causes distances to become
+    uninformative).
 
     Parameters
     ----------
     distances : ndarray
-        Pairwise distance matrix (square) or flattened upper triangle.
+        Pairwise distance matrix (square symmetric) or flattened upper triangle.
     n_bins : int, default=200
-        Number of histogram bins.
-
-    Returns
-    -------
-    analysis : dict
-        Dictionary containing:
-        - 'peak_distance': distance at histogram maximum
-        - 'gaussian_std': estimated std of Gaussian fluctuations
-        - 'gaussian_range': upper bound of Gaussian regime
-        - 'uniform_cutoff': where density drops significantly
-        - 'bin_centers': histogram bin centers
-        - 'prob_density': probability density values
+        Number of histogram bins for the analysis.
     """
-    # Extract upper triangle if square matrix
+    # Extract upper triangle if given a square matrix
     if distances.ndim == 2:
         d = distances[np.triu_indices_from(distances, k=1)]
+
     else:
         d = distances.copy()
 
+    # Filter invalid values
     d = d[np.isfinite(d) & (d >= 0)]
     if d.size == 0:
-        raise ValueError("Empty distances array")
+        raise ValueError("Empty or invalid distances array")
 
-    # Compute histogram
+    # Build histogram
     max_distance = np.percentile(d, 99.9)
     bin_edges = np.linspace(0, max_distance, n_bins + 1)
     prob_density, _ = np.histogram(d, bins=bin_edges, density=True)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
-    # Find peak of distribution
+    # Locate the peak of the distribution
     peak_idx = np.argmax(prob_density)
     peak_distance = bin_centers[peak_idx]
 
@@ -242,7 +250,10 @@ def analyze_distance_distribution(distances, n_bins=200):
         "max_distance": max_distance,
     }
 
-    # === Estimate Gaussian fluctuation range (left side of peak) ===
+    # Estimate Gaussian fluctuation range (left side of peak)
+    # Fit a Gaussian to the left half of the histogram to characterize the short-range
+    # noise regime
+
     left_mask = bin_centers <= peak_distance
     if np.sum(left_mask) > 3:
         try:
@@ -255,19 +266,22 @@ def analyze_distance_distribution(distances, n_bins=200):
                 maxfev=5000,
             )
             analysis["gaussian_std"] = abs(optimal_params[2])
-            # Gaussian range: ~3 sigma from peak
+
+            # Gaussian range extends ~3 sigma from the peak
             analysis["gaussian_range"] = peak_distance + 3 * analysis["gaussian_std"]
+
         except (RuntimeError, ValueError):
-            # Fallback estimate
+            # Fallback: use heuristic estimate
             analysis["gaussian_std"] = peak_distance / 3.0
             analysis["gaussian_range"] = peak_distance * 2.0
 
-    # === Estimate uniform/high-D cutoff (right side of peak) ===
+    #  Estimate high-dimensional cutoff (right side of peak)
+    # Find where density drops to 10% of peak value
+
     right_mask = bin_centers > peak_distance
     right_density = prob_density[right_mask]
 
     if len(right_density) > 3:
-        # Find where density drops to 10% of peak
         peak_density = prob_density[peak_idx]
         threshold = 0.1 * peak_density
         below_threshold = right_density < threshold
@@ -275,6 +289,7 @@ def analyze_distance_distribution(distances, n_bins=200):
         if np.any(below_threshold):
             first_below = np.argmax(below_threshold)
             analysis["uniform_cutoff"] = bin_centers[right_mask][first_below]
+
         else:
             analysis["uniform_cutoff"] = np.percentile(d, 90)
 
@@ -284,6 +299,7 @@ def analyze_distance_distribution(distances, n_bins=200):
         and analysis["uniform_cutoff"] is not None
     ):
         if analysis["gaussian_range"] >= analysis["uniform_cutoff"]:
+            # fallback to default spacing
             analysis["gaussian_range"] = peak_distance + 0.2 * max_distance
             analysis["uniform_cutoff"] = peak_distance + 0.6 * max_distance
 
@@ -293,10 +309,19 @@ def analyze_distance_distribution(distances, n_bins=200):
 def suggest_sigmoid_params(distances, n_components, n_features, n_bins=200):
     """Suggest sigmoid parameters based on distance distribution analysis.
 
-    Following sketchmap.org guidelines:
-    - sigma: placed just before the peak (90% of peak distance)
-    - a_hd, b_hd: control high-D sigmoid shape
-    - a_ld, b_ld: typically 1-2 for low-D (dimension equalization)
+    This function implements heuristics from the Sketch-Map guidelines for automatic
+    parameter selection.
+
+    Parameter selection strategy:
+
+    - sigma: placed just before the peak (90% of peak distance) to ensure the bulk of
+      distances fall in the sigmoid's sensitive region.
+
+    - a_hd, b_hd (high-D sigmoid): control how aggressively short and long distances are
+      compressed.
+
+    - a_ld, b_ld (low-D sigmoid): Typically smaller values to account for the "volume
+      equalization" between high-D and low-D spaces.
 
     Parameters
     ----------
@@ -305,47 +330,46 @@ def suggest_sigmoid_params(distances, n_components, n_features, n_bins=200):
     n_components : int
         Target embedding dimensionality.
     n_features : int
-        Original feature dimensionality.
+        Original feature dimensionality (used for dimension ratio heuristics).
     n_bins : int, default=200
-        Number of histogram bins for analysis.
+        Number of histogram bins for distance analysis.
 
     Returns
     -------
     params : dict
-        Suggested parameters: sigma, a_hd, b_hd, a_ld, b_ld
+        Suggested parameters with keys: ``sigma``, ``a_hd``, ``b_hd``,
+        ``a_ld``, ``b_ld``.
     analysis : dict
-        Distance distribution analysis results.
+        Distance distribution analysis results from
+        :func:`analyze_distance_distribution`.
     """
-    # Analyze distance distribution
     analysis = analyze_distance_distribution(distances, n_bins=n_bins)
 
-    # === Estimate sigma ===
-    # Place sigma just before the peak (90% of peak distance)
-    # This ensures bulk of distances are in the sigmoid's sensitive region
+    # Estimate sigma
     sigma = 0.9 * analysis["peak_distance"]
 
-    # === Estimate a_hd, b_hd (high-dimensional sigmoid) ===
+    # Estimate high-dimensional sigmoid parameters (a_hd, b_hd)
     if (
         analysis["gaussian_range"] is not None
         and analysis["uniform_cutoff"] is not None
     ):
-        # Sharper transition for wider informative range
         range_ratio = analysis["uniform_cutoff"] / max(
             analysis["gaussian_range"], 1e-10
         )
         a_hd = np.clip(2.0 + np.log(range_ratio), 2.0, 6.0)
         b_hd = np.clip(a_hd * 2, 4.0, 12.0)
+
     else:
-        # defaults
         a_hd = 2.0
         b_hd = 6.0
 
-    # === Estimate a_ld, b_ld (low-dimensional sigmoid) ===
-    # Rule of thumb: a_ld/d ≈ a_hd/D for volume equalization
+    # Estimate low-dimensional sigmoid parameters (a_ld, b_ld)
     if n_features > 0:
         a_ld = np.clip(a_hd * n_components / n_features, 1.0, 2.0)
+
     else:
         a_ld = 2.0
+
     b_ld = np.clip(a_ld, 1.0, 2.0)
 
     params = {
@@ -359,102 +383,150 @@ def suggest_sigmoid_params(distances, n_components, n_features, n_bins=200):
     return params, analysis
 
 
-# =============================================================================
-# Main SketchMap class
-# =============================================================================
+# Main class
 
 
 class SketchMap(TransformerMixin, BaseEstimator):
-    """Sketch-Map dimensionality reduction.
+    """
+    Sketch-Map is a nonlinear dimensionality reduction algorithm. Unlike methods that
+    try to preserve all pairwise distances (MDS) or only local neighborhoods (t-SNE),
+    Sketch-Map selectively focuses on intermediate-range distances using sigmoid
+    transformations: short distances (r << sigma) compressed toward 0 (these often
+    represent thermal noise or fluctuations that should not dominate the embedding),
+    long distances (r >> sigma) compressed toward 1 (in high dimensions, very long
+    distances become unreliable due to the "curse of dimensionality"), intermediate
+    distances (r near sigma) are preserved (these contain the meaningful structural
+    information).
 
-    Sketch-Map transforms distances using sigmoid functions to focus on
-    intermediate-range structure, ignoring both very short distances
-    (Gaussian fluctuations) and very long distances (high-D topology effects).
+    The sigmoid function has the form::
+
+        s(r) = 1 - (1 + A * (r/sigma)^a)^(-b/a)
+
+    where:
+
+    - sigma is the "switching distance" where s(sigma) = 0.5
+    - a controls short-range steepness
+    - b controls long-range steepness
+
+    Separate sigmoids are applied to high-D distances (a_hd, b_hd) and
+    low-D distances (a_ld, b_ld), allowing different compression behaviors.
+
+    The fitting process proceeds in stages:
+
+    1. Initialization: classical MDS provides starting coordinates
+    2. MDS refinement (optional): optimize raw distance stress
+    3. Pre-optimization: initial sigmoid-transformed optimization
+    4. Main optimization: full optimization
+    5. Global optimization (optional): basin-hopping for better minima
 
     Parameters
     ----------
     n_components : int, default=2
-        Dimensionality of the target embedding.
+        Number of dimensions in the target embedding space.
 
     params : dict or None, default=None
-        Sigmoid parameters dictionary with keys:
-        - 'sigma': switching distance where s(sigma) = 0.5
-        - 'a_hd': high-D sigmoid short-range steepness
-        - 'b_hd': high-D sigmoid long-range steepness
-        - 'a_ld': low-D sigmoid short-range steepness
-        - 'b_ld': low-D sigmoid long-range steepness
+        Sigmoid parameters dictionary. Keys are:
 
-        If None, parameters are estimated automatically from data.
-        Partial dicts are allowed; missing keys will be estimated.
+        - ``sigma`` : float - Switching distance where s(sigma) = 0.5
+        - ``a_hd`` : float - High-D sigmoid short-range steepness
+        - ``b_hd`` : float - High-D sigmoid long-range steepness
+        - ``a_ld`` : float - Low-D sigmoid short-range steepness
+        - ``b_ld`` : float - Low-D sigmoid long-range steepness
 
-        Example: params={"sigma": 7.0, "a_hd": 4.0, "b_hd": 2.0,
-                         "a_ld": 2.0, "b_ld": 2.0}
+        If None, all parameters are estimated automatically from the data.
+        Partial dictionaries are allowed; missing keys use auto-estimated values.
 
     mds_opt_steps : int, default=100
-        Number of MDS optimization steps (identity transform) before
-        applying sigmoid. Set to 0 to skip.
+        Number of MDS optimization steps (raw distances, no sigmoid) before
+        applying the sigmoid transformation. Set to 0 to skip this stage.
+        This helps refine the classical MDS initialization.
 
     optimizer : str, default="L-BFGS-B"
-        Optimization method: "L-BFGS-B" or "CG".
+        Optimization algorithm. Options: ``"L-BFGS-B"`` or ``"CG"``.
 
     preopt_steps : int, default=100
-        Number of pre-optimization steps with sigmoid transform.
+        Number of pre-optimization steps with sigmoid transformation.
+        Uses the same settings as main optimization but fewer iterations.
 
     max_iter : int, default=1000
-        Number of main optimization steps with sigmoid transform.
+        Maximum iterations for the main optimization stage.
 
-    global_opt_steps : int or None, default=None
+    global_opt : int or None, default=None
         Number of basin-hopping iterations for global optimization.
+        Basin-hopping can escape local minima but is computationally expensive.
         Set to None to disable.
 
     mixing_ratio : float, default=0.0
-        Balance between direct distance stress (1.0) and transformed
-        distance stress (0.0).
+        Balance between raw distance stress and transformed distance stress:
+
+        - 0.0: Pure sigmoid-transformed stress
+        - 1.0: Pure raw distance stress
+        - Values in between: linear combination
 
     center : bool, default=True
-        If True, center input data before computing distances.
+        Whether to center the input data (subtract mean) before computing
+        pairwise distances.
 
-    init : array-like or None, default=None
-        Initial embedding coordinates. If None, use classical MDS.
+    init : array-like of shape (n_samples, n_components) or None, default=None
+        Initial embedding coordinates. If None, classical MDS is used.
 
     random_state : int or None, default=None
-        Random seed for reproducibility.
+        Random seed for reproducibility (affects global optimization).
 
     verbose : bool, default=False
-        If True, print progress information.
+        If True, print progress information during fitting.
 
     Attributes
     ----------
     embedding_ : ndarray of shape (n_samples, n_components)
-        The low-dimensional embedding.
+        The fitted low-dimensional embedding coordinates.
 
     stress_ : float
-        Final stress value.
+        Final stress value (lower is better).
 
     params_ : dict
-        The sigmoid parameters used (estimated or provided).
+        The sigmoid parameters actually used (combination of user-provided
+        and auto-estimated values).
 
     suggested_params_ : dict
-        Auto-suggested parameters (available after fit).
+        Auto-suggested parameters based on distance distribution analysis.
+        Available after fitting, useful for understanding the data.
 
     distance_analysis_ : dict
-        Distance distribution analysis results.
+        Results from the distance distribution analysis, including peak
+        distance, Gaussian range estimates, and histogram data.
+
+    n_samples_ : int
+        Number of samples in the training data.
+
+    n_features_ : int
+        Number of features in the training data.
+
+    See Also
+    --------
+    sklearn.manifold.MDS : Multidimensional scaling (linear).
+    sklearn.manifold.TSNE : t-SNE for visualization.
 
     Examples
     --------
+    Basic usage with automatic parameter estimation:
+
     >>> from skmatter.decomposition import SketchMap
     >>> import numpy as np
     >>> X = np.random.randn(100, 50)
-    >>> # Auto-estimate all parameters
-    >>> sm = SketchMap(n_components=2)
+    >>> sm = SketchMap(n_components=2, random_state=42)
     >>> embedding = sm.fit_transform(X)
-    >>> # Or provide specific parameters
-    >>> sm = SketchMap(
-    ...     n_components=2,
-    ...     params={"sigma": 7.0, "a_hd": 4.0, "b_hd": 2.0,
-    ...             "a_ld": 2.0, "b_ld": 2.0}
-    ... )
+    >>> print(embedding.shape)
+    (100, 2)
+
+    Using specific sigmoid parameters:
+
+    >>> params = {"sigma": 7.0, "a_hd": 4.0, "b_hd": 2.0,
+    ...           "a_ld": 2.0, "b_ld": 2.0}
+    >>> sm = SketchMap(n_components=2, params=params)
     >>> embedding = sm.fit_transform(X)
+    >>> print(embedding.shape)
+    (100, 2)
     """
 
     def __init__(
@@ -465,7 +537,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         optimizer="L-BFGS-B",
         preopt_steps=100,
         max_iter=1000,
-        global_opt_steps=None,
+        global_opt=None,
         mixing_ratio=0.0,
         center=True,
         init=None,
@@ -478,12 +550,14 @@ class SketchMap(TransformerMixin, BaseEstimator):
         self.optimizer = optimizer
         self.preopt_steps = preopt_steps
         self.max_iter = max_iter
-        self.global_opt_steps = global_opt_steps
+        self.global_opt = global_opt
         self.mixing_ratio = mixing_ratio
         self.center = center
         self.init = init
         self.random_state = random_state
         self.verbose = verbose
+
+    # Stress computation
 
     def _compute_stress(
         self,
@@ -495,26 +569,39 @@ class SketchMap(TransformerMixin, BaseEstimator):
         mixing_ratio,
         use_transform=True,
     ):
-        """Compute the sketch-map stress function.
+        """Compute the Sketch-Map stress function.
 
-        Stress measures how well the low-D embedding preserves the
-        (transformed) high-D distances.
+        The stress measures the discrepancy between (transformed) high-D distances and
+        (transformed) low-D distances. Lower stress indicates a better embedding.
+
+        The stress formula is::
+
+            stress = sum_ij w_ij * [(1-m)*(s_hd(D_ij) - s_ld(d_ij))^2
+                     + m*(D_ij - d_ij)^2]
+
+        where:
+
+        - D_ij is the high-D distance between points i and j
+        - d_ij is the low-D distance
+        - s_hd and s_ld are the high-D and low-D sigmoid functions
+        - w_ij are pairwise weights
+        - m is the mixing_ratio
 
         Parameters
         ----------
-        embedding : ndarray, shape (n*d,) or (n, d)
-            Low-dimensional coordinates.
-        hd_distances : ndarray, shape (n, n)
+        embedding : ndarray, shape (n_samples * n_components,) or (n, d)
+            Low-dimensional coordinates (flat or 2D).
+        hd_distances : ndarray of shape (n_samples, n_samples)
             High-dimensional pairwise distances.
-        hd_transformed : ndarray, shape (n, n)
+        hd_transformed : ndarray of shape (n_samples, n_samples)
             Sigmoid-transformed high-dimensional distances.
-        weights : ndarray, shape (n, n)
+        weights : ndarray of shape (n_samples, n_samples)
             Pairwise weight matrix.
         total_weight : float
-            Sum of upper-triangle weights.
+            Sum of upper-triangle weights (for normalization).
         mixing_ratio : float
-            Balance between direct (1.0) and transformed (0.0) stress.
-        use_transform : bool
+            Balance between transformed (0) and raw (1) stress.
+        use_transform : bool, default=True
             Whether to apply sigmoid to low-D distances.
 
         Returns
@@ -522,15 +609,15 @@ class SketchMap(TransformerMixin, BaseEstimator):
         stress : float
             Normalized stress value.
         """
-        # Reshape if flattened
+        # Reshape flat embedding to matrix form
         if embedding.ndim == 1:
             n_samples = hd_distances.shape[0]
             embedding = embedding.reshape((n_samples, self.n_components))
 
-        # Compute low-dimensional distances
+        # Compute low-dimensional pairwise distances
         ld_distances = squareform(pdist(embedding, metric="euclidean"))
 
-        # Transform low-D distances if requested
+        # Apply sigmoid transformation to low-D distances
         if use_transform:
             ld_transformed = sigmoid_transform(
                 ld_distances,
@@ -541,19 +628,22 @@ class SketchMap(TransformerMixin, BaseEstimator):
         else:
             ld_transformed = ld_distances
 
-        # Compute stress on upper triangle only
+        # Compute stress only on upper triangle
         triu_idx = np.triu_indices_from(hd_distances, k=1)
 
         diff_transformed = (hd_transformed[triu_idx] - ld_transformed[triu_idx]) ** 2
         diff_direct = (hd_distances[triu_idx] - ld_distances[triu_idx]) ** 2
         weights_triu = weights[triu_idx]
 
+        # Combine transformed and direct stress according to mixing_ratio
         stress = np.sum(
             weights_triu
             * ((1.0 - mixing_ratio) * diff_transformed + mixing_ratio * diff_direct)
         )
 
         return stress / total_weight
+
+    # Gradient computation
 
     def _compute_gradient(
         self,
@@ -565,40 +655,46 @@ class SketchMap(TransformerMixin, BaseEstimator):
         mixing_ratio,
         use_transform=True,
     ):
-        """Compute gradient of the stress function.
+        """Compute the gradient of the stress function.
+
+        The gradient is used by optimization algorithms (L-BFGS-B, CG) to
+        find the embedding that minimizes stress.
 
         Parameters
         ----------
         embedding : ndarray
-            Low-dimensional coordinates (flat or matrix).
+            Low-dimensional coordinates (flat or 2D).
         hd_distances : ndarray
-            High-dimensional distances.
+            High-dimensional pairwise distances.
         hd_transformed : ndarray
             Transformed high-dimensional distances.
         weights : ndarray
-            Weight matrix.
+            Pairwise weight matrix.
         total_weight : float
-            Total weight.
+            Total weight for normalization.
         mixing_ratio : float
-            Mixing ratio.
-        use_transform : bool
-            Whether to use sigmoid transform.
+            Balance between transformed and raw stress.
+        use_transform : bool, default=True
+            Whether sigmoid transformation is applied.
 
         Returns
         -------
-        gradient : ndarray
+        gradient : ndarray of shape (n_samples * n_components,)
             Flattened gradient vector.
         """
-        # Reshape if flattened
+        # Reshape flat embedding to matrix form
         if embedding.ndim == 1:
             n_samples = hd_distances.shape[0]
             embedding = embedding.reshape((n_samples, self.n_components))
 
-        # Compute pairwise differences and distances
+        # Compute pairwise displacement vectors and distances
+        # diff_vectors[i,j] = embedding[i] - embedding[j]
+
         diff_vectors = embedding[:, None, :] - embedding[None, :, :]
         ld_distances = np.sqrt(np.sum(diff_vectors**2, axis=2))
 
-        # Transform and derivatives
+        # Compute sigmoid transformation and its derivative
+
         if use_transform:
             ld_transformed = sigmoid_transform(
                 ld_distances,
@@ -612,16 +708,20 @@ class SketchMap(TransformerMixin, BaseEstimator):
                 self.params_["a_ld"],
                 self.params_["b_ld"],
             )
+
         else:
             ld_transformed = ld_distances
             ld_derivative = np.ones_like(ld_distances)
 
-        # Compute gradient coefficients
+        # Compute gradient coefficients based on mixing_ratio
+        # The gradient comes from differentiating the stress w.r.t. coordinates
+
         if mixing_ratio == 0.0:
             # Pure transformed stress
             coefficients = weights * (hd_transformed - ld_transformed) * ld_derivative
+
         else:
-            # Mixed stress
+            # Mixed stress: includes both transformed and raw distance terms
             eps = 1e-100
             inv_distance = 1.0 / np.maximum(ld_distances, eps)
             coefficients = (
@@ -637,12 +737,16 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         np.fill_diagonal(coefficients, 0.0)
 
-        # Compute gradient
+        # Compute gradient using efficient matrix operations
+        # d(stress)/d(x_i) = -2 * sum_j c_ij * (x_i - x_j)
+
         row_sums = coefficients.sum(axis=1)
         gradient = (row_sums[:, None] * embedding) - (coefficients @ embedding)
         gradient = -2.0 * gradient / total_weight
 
         return gradient.ravel()
+
+    # Optimization methods
 
     def _optimize(
         self,
@@ -655,36 +759,41 @@ class SketchMap(TransformerMixin, BaseEstimator):
         n_steps,
         use_transform=True,
     ):
-        """Run optimization to minimize stress.
+        """Run gradient-based optimization to minimize stress.
+
+        Uses scipy.optimize.minimize with the configured optimizer
+        (L-BFGS-B or CG).
 
         Parameters
         ----------
-        initial_embedding : ndarray
+        initial_embedding : ndarray of shape (n_samples, n_components)
             Starting coordinates.
         hd_distances : ndarray
-            High-dimensional distances.
+            High-dimensional pairwise distances.
         hd_transformed : ndarray
             Transformed high-dimensional distances.
         weights : ndarray
-            Weight matrix.
+            Pairwise weight matrix.
         total_weight : float
-            Total weight.
+            Total weight for normalization.
         mixing_ratio : float
-            Mixing ratio.
+            Balance between transformed and raw stress.
         n_steps : int
-            Maximum iterations.
-        use_transform : bool
-            Whether to use sigmoid transform.
+            Maximum number of optimization iterations.
+        use_transform : bool, default=True
+            Whether to apply sigmoid transformation.
 
         Returns
         -------
-        optimized_embedding : ndarray
+        optimized_embedding : ndarray of shape (n_samples, n_components)
             Optimized coordinates.
         final_stress : float
             Final stress value.
         """
         n_samples = initial_embedding.shape[0]
         x0 = initial_embedding.ravel()
+
+        # Define objective and gradient functions
 
         def objective(x):
             return self._compute_stress(
@@ -707,6 +816,8 @@ class SketchMap(TransformerMixin, BaseEstimator):
                 mixing_ratio,
                 use_transform,
             )
+
+        # Run optimization
 
         result = minimize(
             objective,
@@ -731,27 +842,29 @@ class SketchMap(TransformerMixin, BaseEstimator):
         total_weight,
         n_iterations,
     ):
-        """Global optimization using basin hopping.
+        """Run global optimization using basin-hopping which combines local optimization
+        with random perturbations to escape local minima. This is computationally
+        expensive but can find better solutions for complex landscapes.
 
         Parameters
         ----------
-        embedding : ndarray
-            Current embedding.
+        embedding : ndarray of shape (n_samples, n_components)
+            Current embedding (starting point).
         hd_distances : ndarray
-            High-dimensional distances.
+            High-dimensional pairwise distances.
         hd_transformed : ndarray
             Transformed distances.
         weights : ndarray
-            Weight matrix.
+            Pairwise weight matrix.
         total_weight : float
-            Total weight.
+            Total weight for normalization.
         n_iterations : int
-            Number of basin hopping iterations.
+            Number of basin-hopping iterations.
 
         Returns
         -------
-        optimized_embedding : ndarray
-            Optimized coordinates.
+        optimized_embedding : ndarray of shape (n_samples, n_components)
+            Globally optimized coordinates.
         final_stress : float
             Final stress value.
         """
@@ -789,10 +902,13 @@ class SketchMap(TransformerMixin, BaseEstimator):
         if self.verbose:
             print(f"\n=== Global optimization (basin hopping, {n_iterations} iter) ===")
 
-        # Random displacement step
+        # Custom random displacement for basin-hopping
+
         rng = np.random.default_rng(self.random_state)
 
         class RandomDisplacement:
+            """Random step generator for basin-hopping."""
+
             def __init__(self, stepsize, rng):
                 self.stepsize = stepsize
                 self.rng = rng
@@ -800,6 +916,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
             def __call__(self, x):
                 return x + self.rng.uniform(-self.stepsize, self.stepsize, x.shape)
 
+        # Step size proportional to embedding scale
         scale = np.std(embedding)
         take_step = RandomDisplacement(stepsize=scale * 0.5, rng=rng)
 
@@ -817,24 +934,31 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         return result.x.reshape((n_samples, self.n_components)), result.fun
 
+    # Public API: fit, transform, fit_transform
+
     def fit(self, X, y=None, sample_weights=None):
-        """Fit the Sketch-Map model.
+        """Fit the Sketch-Map model to the training data.
+
+        This method computes the low-dimensional embedding by 1) computing pairwise
+        distances in the input space 2) estimating sigmoid parameters (if not provided)
+        3) transforming distances using the sigmoid function 4) optimizing embedding
+        coordinates to minimize stress.
 
         Parameters
         ----------
-        X : array-like, shape (n_samples, n_features)
-            Training data.
+        X : array-like of shape (n_samples, n_features)
+            Training data. Each row is a sample, each column is a feature.
         y : Ignored
-            Not used, present for API consistency.
-        sample_weights : array-like, shape (n_samples,), optional
-            Per-sample weights.
+            Not used, present for scikit-learn API compatibility.
+        sample_weights : array-like of shape (n_samples,), optional
+            Per-sample weights. Samples with higher weights have more
+            influence on the embedding. Default is uniform weights.
 
         Returns
         -------
-        self : object
-            Returns the instance itself.
+        self : SketchMap
+            Returns the fitted instance.
         """
-        # Validate input
         X = validate_data(self, X, reset=True, dtype=np.float64)
         self.X_ = X.copy()
 
@@ -855,57 +979,58 @@ class SketchMap(TransformerMixin, BaseEstimator):
         if self.verbose:
             print(f"Fitting Sketch-Map: {n_samples} samples, {n_features} features")
 
-        # -----------------------------------------------------------------
-        # Step 1: Preprocess data and compute distances
-        # -----------------------------------------------------------------
-        X_centered = X.copy()
+        # Compute pairwise distances
+
+        X_processed = X.copy()
         if self.center:
-            X_centered = X_centered - X_centered.mean(axis=0, keepdims=True)
+            X_processed = X_processed - X_processed.mean(axis=0, keepdims=True)
+
             if self.verbose:
                 print("Data centered")
 
         if self.verbose:
             print("Computing pairwise distances...")
-        hd_distances = squareform(pdist(X_centered, metric="euclidean"))
 
-        # -----------------------------------------------------------------
-        # Step 2: Determine sigmoid parameters
-        # -----------------------------------------------------------------
-        # Always compute suggested parameters for reference
+        hd_distances = squareform(pdist(X_processed, metric="euclidean"))
+
+        # Determine sigmoid parameters
+
         suggested, analysis = suggest_sigmoid_params(
             hd_distances, self.n_components, n_features
         )
         self.suggested_params_ = suggested
         self.distance_analysis_ = analysis
 
-        # Merge user-provided params with suggested params
         if self.params is None:
             # Use all suggested parameters
             self.params_ = suggested.copy()
+
             if self.verbose:
                 print("Using auto-estimated sigmoid parameters:")
+
         else:
-            # Start with suggested, override with user-provided
+            # Start with suggested, override with user-provided values
             self.params_ = suggested.copy()
+
             for key in ["sigma", "a_hd", "b_hd", "a_ld", "b_ld"]:
                 if key in self.params and self.params[key] is not None:
                     self.params_[key] = self.params[key]
+
             if self.verbose:
                 print("Using sigmoid parameters (user + auto-estimated):")
 
         if self.verbose:
-            print(f"  sigma = {self.params_['sigma']:.4f}")
+            print(f"sigma = {self.params_['sigma']:.4f}")
             print(
-                f"  a_hd = {self.params_['a_hd']:.2f}, b_hd = {self.params_['b_hd']:.2f}"
+                f"a_hd = {self.params_['a_hd']:.2f}, b_hd = {self.params_['b_hd']:.2f}"
             )
             print(
-                f"  a_ld = {self.params_['a_ld']:.2f}, b_ld = {self.params_['b_ld']:.2f}"
+                f"a_ld = {self.params_['a_ld']:.2f}, b_ld = {self.params_['b_ld']:.2f}"
             )
-            print(f"  (peak distance = {analysis['peak_distance']:.4f})")
+            print(f"(peak distance = {analysis['peak_distance']:.4f})")
 
-        # -----------------------------------------------------------------
-        # Step 3: Transform high-dimensional distances
-        # -----------------------------------------------------------------
+        # Apply sigmoid transformation to high-D distances
+
         hd_transformed = sigmoid_transform(
             hd_distances,
             self.params_["sigma"],
@@ -913,40 +1038,43 @@ class SketchMap(TransformerMixin, BaseEstimator):
             self.params_["b_hd"],
         )
 
-        # -----------------------------------------------------------------
-        # Step 4: Setup weight matrix
-        # -----------------------------------------------------------------
+        # Setup weight matrix
+
         if sample_weights is not None:
             w = np.asarray(sample_weights)
+
             if w.shape[0] != n_samples:
                 raise ValueError(
                     f"sample_weights length {w.shape[0]} != n_samples {n_samples}"
                 )
             weights = np.outer(w, w)
             total_weight = np.sum(np.triu(weights, k=1))
+
             if self.verbose:
                 print(f"Using sample weights (total_weight = {total_weight:.4f})")
+
         else:
             weights = np.ones_like(hd_distances)
             total_weight = n_samples * (n_samples - 1) / 2.0
+
             if self.verbose:
                 print(f"Using uniform weights (total_weight = {total_weight:.0f})")
 
-        # -----------------------------------------------------------------
-        # Step 5: Initialize embedding
-        # -----------------------------------------------------------------
+        # Initialize embedding
+
         if self.init is not None:
             embedding = np.asarray(self.init).copy()
+
             if self.verbose:
                 print(f"Using provided initialization, shape = {embedding.shape}")
+
         else:
             if self.verbose:
                 print("Initializing with classical MDS...")
             embedding = classical_mds(hd_distances, self.n_components)
 
-        # -----------------------------------------------------------------
-        # Step 6: MDS optimization (identity transform)
-        # -----------------------------------------------------------------
+        # MDS pre-optimization
+
         if self.mds_opt_steps > 0 and self.init is None:
             if self.verbose:
                 print(
@@ -956,10 +1084,10 @@ class SketchMap(TransformerMixin, BaseEstimator):
             embedding, mds_stress = self._optimize(
                 embedding,
                 hd_distances,
-                hd_distances,  # No transform
+                hd_distances,  # target = raw distances (no transform)
                 weights,
                 total_weight,
-                mixing_ratio=1.0,  # Pure distance stress
+                mixing_ratio=1.0,  # pure raw distance stress
                 n_steps=self.mds_opt_steps,
                 use_transform=False,
             )
@@ -967,9 +1095,8 @@ class SketchMap(TransformerMixin, BaseEstimator):
             if self.verbose:
                 print(f"MDS stress: {mds_stress:.6f}")
 
-        # -----------------------------------------------------------------
-        # Step 7: Pre-optimization (sigmoid transform)
-        # -----------------------------------------------------------------
+        # Pre-optimization with sigmoid transformation
+
         stress = 0.0
         if self.preopt_steps > 0:
             if self.verbose:
@@ -991,9 +1118,8 @@ class SketchMap(TransformerMixin, BaseEstimator):
             if self.verbose:
                 print(f"Pre-optimization stress: {stress:.6f}")
 
-        # -----------------------------------------------------------------
-        # Step 9: Main optimization
-        # -----------------------------------------------------------------
+        # Main optimization
+
         if self.max_iter > 0:
             if self.verbose:
                 print(f"\n=== Stage 2: Main optimization ({self.max_iter} steps) ===")
@@ -1012,13 +1138,12 @@ class SketchMap(TransformerMixin, BaseEstimator):
             if self.verbose:
                 print(f"Final stress: {stress:.6f}")
 
-        # -----------------------------------------------------------------
-        # Step 8: Global optimization (optional)
-        # -----------------------------------------------------------------
-        if self.global_opt_steps is not None:
-            if not isinstance(self.global_opt_steps, int) or self.global_opt_steps < 1:
+        # Global optimization
+
+        if self.global_opt is not None:
+            if not isinstance(self.global_opt, int) or self.global_opt < 1:
                 raise ValueError(
-                    f"global_opt_steps must be positive int, got {self.global_opt_steps}"
+                    f"global_opt must be a positive int, got {self.global_opt}"
                 )
 
             embedding, stress = self._global_optimize(
@@ -1027,11 +1152,20 @@ class SketchMap(TransformerMixin, BaseEstimator):
                 hd_transformed,
                 weights,
                 total_weight,
-                self.global_opt_steps,
+                self.global_opt,
             )
 
+        # Store results
         self.embedding_ = embedding
         self.stress_ = stress
+
+        # Track total iterations for sklearn compatibility
+        n_iter = self.mds_opt_steps + self.preopt_steps + self.max_iter
+
+        if self.global_opt is not None:
+            n_iter += self.global_opt
+
+        self.n_iter_ = n_iter
 
         if self.verbose:
             print("\nSketch-Map fitting complete!")
@@ -1043,17 +1177,17 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         Parameters
         ----------
-        X : array-like, shape (n_samples, n_features)
+        X : array-like of shape (n_samples, n_features)
             Training data.
         y : Ignored
-            Not used, present for API consistency.
-        sample_weights : array-like, shape (n_samples,), optional
+            Not used, present for scikit-learn API compatibility.
+        sample_weights : array-like of shape (n_samples,), optional
             Per-sample weights.
 
         Returns
         -------
-        embedding : ndarray, shape (n_samples, n_components)
-            Low-dimensional embedding.
+        embedding : ndarray of shape (n_samples, n_components)
+            Low-dimensional embedding coordinates.
         """
         self.fit(X, y, sample_weights=sample_weights)
         return self.embedding_
@@ -1061,30 +1195,31 @@ class SketchMap(TransformerMixin, BaseEstimator):
     def transform(self, X):
         """Project data to the embedding space.
 
-        Note: Only supports in-sample transformation (same data used for fit).
-        Out-of-sample projection is not implemented.
+        This method only supports in-sample transformation (data points that were used
+        during fitting). Out-of-sample projection is not currently implemented.
+
+        For new data points, consider using landmark-based approaches.
 
         Parameters
         ----------
-        X : array-like, shape (n_samples, n_features)
-            Data to transform.
+        X : array-like of shape (n_samples, n_features)
+            Data to transform. Must be rows from the original training data.
 
         Returns
         -------
-        embedding : ndarray, shape (n_samples, n_components)
-            Embedded coordinates.
+        embedding : ndarray of shape (n_samples, n_components)
+            Embedded coordinates for the input samples.
         """
         check_is_fitted(self, ["embedding_", "X_"])
         X = validate_data(self, X, reset=False)
 
-        # Match rows to training data
         indices = []
         for row in X:
             matches = np.all(np.isclose(self.X_, row, rtol=1e-8, atol=1e-12), axis=1)
             if not np.any(matches):
                 warnings.warn(
                     "SketchMap.transform only supports in-sample rows. "
-                    "Out-of-sample projection is not implemented.",
+                    "Out-of-sample projection is not yet implemented.",
                     UserWarning,
                 )
             indices.append(int(np.argmax(matches)))
@@ -1092,24 +1227,24 @@ class SketchMap(TransformerMixin, BaseEstimator):
         return self.embedding_[indices]
 
     def predict(self, X):
-        """Alias for transform."""
+        """Alias for :meth:`transform` (for API compatibility)."""
         return self.transform(X)
 
     def score(self, X, y=None):
-        """Return negative stress as score (higher is better).
+        """Return negative stress as a score.
 
         Parameters
         ----------
-        X : array-like
-            Ignored, present for API consistency.
+        X : array-like of shape (n_samples, n_features)
+            Input data. Used only for feature validation.
         y : array-like
-            Ignored, present for API consistency.
+            Ignored, present for scikit-learn API compatibility.
 
         Returns
         -------
         score : float
-            Negative of final stress value.
+            Negative of the final stress value.
         """
         check_is_fitted(self, ["stress_"])
-        X = validate_data(self, X, reset=False)
+        validate_data(self, X, reset=False)
         return -self.stress_
