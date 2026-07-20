@@ -212,6 +212,12 @@ class SketchMap(TransformerMixin, BaseEstimator):
         init=None,
         verbose=False,
         progress_bar=False,
+        backend="numpy",
+        devices=None,
+        row_tile=8192,
+        col_tile=16384,
+        compile_kernel=True,
+        param_subsample=4000,
     ):
         self.n_components = n_components
         self.sigma = sigma
@@ -229,6 +235,12 @@ class SketchMap(TransformerMixin, BaseEstimator):
         self.init = init
         self.verbose = verbose
         self.progress_bar = progress_bar
+        self.backend = backend
+        self.devices = devices
+        self.row_tile = row_tile
+        self.col_tile = col_tile
+        self.compile_kernel = compile_kernel
+        self.param_subsample = param_subsample
 
     def _resolve_global_opt(self):
         """Mixing ratios to anneal through (MDS-like first), or None to skip."""
@@ -271,6 +283,9 @@ class SketchMap(TransformerMixin, BaseEstimator):
         dstress/dx_i = -2/tw sum_j c_ij (x_i - x_j),
         c_ij = w_ij ((1-m)(s_hd - s_ld) s_ld' + m (D - d)) / d
         """
+        if hasattr(problem, "stress_and_grad"):
+            return problem.stress_and_grad(flat_embedding, mixing_ratio, use_transform)
+
         hd_distances, hd_transformed, weights, total_weight = problem
         n_samples = hd_distances.shape[0]
         # scipy's x and cdist's output are float64; work in the fitted dtype
@@ -381,9 +396,16 @@ class SketchMap(TransformerMixin, BaseEstimator):
         weights = np.outer(per_sample, per_sample)
         return weights, float(np.sum(np.triu(weights, k=1)))
 
-    def _initial_embedding(self, hd_distances, n_samples, dtype):
+    def _initial_embedding(self, hd_distances, n_samples, dtype, tiled=False):
         """Starting coordinates: the user's ``init``, else classical MDS."""
         if self.init is None:
+            if tiled:
+                raise ValueError(
+                    "backend='torch' requires init=: classical_mds needs the full "
+                    "n x n distance matrix. For Euclidean data "
+                    "PCA(n_components).fit_transform(X) is the same embedding up to "
+                    "rotation, and is what MAD used."
+                )
             if self.verbose:
                 print("Initializing with classical MDS...")
             return classical_mds(hd_distances, self.n_components)
@@ -441,23 +463,59 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         X_mean = X.mean(axis=0, keepdims=True) if self.center else 0.0
         X_processed = X - X_mean
-        hd_distances = cdist(X_processed, X_processed).astype(X.dtype, copy=False)
+        tiled = self.backend == "torch"
+        if tiled:
+            param_sample = X_processed
+            if n_samples > self.param_subsample:
+                sampled_rows = np.random.default_rng(0).choice(
+                    n_samples, self.param_subsample, replace=False
+                )
+                param_sample = X_processed[np.sort(sampled_rows)]
+            hd_distances = cdist(param_sample, param_sample).astype(
+                X.dtype, copy=False
+            )
+        else:
+            hd_distances = cdist(X_processed, X_processed).astype(X.dtype, copy=False)
 
         self._resolve_params(hd_distances)
         if self.verbose:
             formatted = ", ".join(f"{k} = {v:.4g}" for k, v in self.params_.items())
             print(f"Using sigmoid parameters: {formatted}")
 
-        hd_transformed = sigmoid_transform(
-            hd_distances,
-            self.params_["sigma"],
-            self.params_["a_high"],
-            self.params_["b_high"],
-        )
-        weights, total_weight = self._pair_weights(sample_weight, n_samples, X.dtype)
-        problem = (hd_distances, hd_transformed, weights, total_weight)
+        if tiled:
+            from ._sketchmap_torch import TiledStress
 
-        embedding = self._initial_embedding(hd_distances, n_samples, X.dtype)
+            problem = TiledStress(
+                X_processed,
+                sample_weight,
+                self.n_components,
+                self.params_,
+                devices=self.devices,
+                row_tile=self.row_tile,
+                col_tile=self.col_tile,
+                compile_kernel=self.compile_kernel,
+            )
+            if self.verbose:
+                print(
+                    f"torch backend: {len(problem.devices)} device(s), tiles "
+                    f"{self.row_tile}x{self.col_tile}, "
+                    f"total_weight={problem.total_weight:.6e}"
+                )
+        else:
+            hd_transformed = sigmoid_transform(
+                hd_distances,
+                self.params_["sigma"],
+                self.params_["a_high"],
+                self.params_["b_high"],
+            )
+            weights, total_weight = self._pair_weights(
+                sample_weight, n_samples, X.dtype
+            )
+            problem = (hd_distances, hd_transformed, weights, total_weight)
+
+        embedding = self._initial_embedding(
+            hd_distances, n_samples, X.dtype, tiled=tiled
+        )
 
         if self.mds_opt_steps > 0 and self.init is None:
             if self.verbose:
