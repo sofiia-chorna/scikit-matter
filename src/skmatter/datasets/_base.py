@@ -37,6 +37,32 @@ def load_nice_dataset():
     return Bunch(data=data, DESCR=fdescr)
 
 
+def load_sketchmap_dimred_reference():
+    """Load and return the reference sketch-map embedding.
+
+    Returns
+    -------
+    sketchmap_dimred_reference_data : sklearn.utils.Bunch
+      Dictionary-like object, with the following attributes:
+
+      data : `numpy.ndarray` --
+      the (64, 2) embedding of the first 64 digits of
+      :func:`sklearn.datasets.load_digits` computed with the reference C++
+      implementation.
+
+      DESCR: `str` --
+        The full description of the dataset.
+    """
+    module_path = dirname(__file__)
+    target_filename = join(module_path, "data", "sketchmap_dimred_reference.dat")
+    data = np.loadtxt(target_filename)
+
+    with open(join(module_path, "descr", "sketchmap_dimred_reference.rst")) as rst_file:
+        fdescr = rst_file.read()
+
+    return Bunch(data=data, DESCR=fdescr)
+
+
 def load_degenerate_CH4_manifold():
     """Load and return the degenerate manifold dataset.
 
