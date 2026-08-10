@@ -13,6 +13,9 @@ The rules for CHANGELOG file:
 
 Unreleased
 ----------
+- Add ``SketchMap``, a nonlinear dimensionality-reduction method validated against the
+  reference C++ implementation, together with the ``load_sketchmap_dimred_reference``
+  validation dataset and two gallery examples
 
 0.3.3 (2026/01/06)
 ------------------
