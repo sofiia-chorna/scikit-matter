@@ -85,8 +85,8 @@ saturating sigmoid before matching them, and the embedding is driven by the inte
 range.
 
 The :ref:`example <sphx_glr_examples_decomposition_sketchmap.py>` introduces the method,
-walks through the landmark workflow used for large datasets, and validates the
-implementation against the reference C++ code.
+walks through the landmark workflow used for large datasets, and shows how the
+implementation reproduces a published sketch-map of the reference C++ code.
 
 .. autoclass:: skmatter.decomposition.SketchMap
     :show-inheritance:

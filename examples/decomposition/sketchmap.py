@@ -38,17 +38,13 @@ This example follows that landmark workflow on a set of unevenly populated basin
 3. let sketch-map estimate the sigmoid parameters from the weighted landmarks,
 4. fit sketch-map on the weighted landmarks,
 
-and then validates the implementation against the reference C++ code.
+and then shows how the published protein map of the reference C++ code is reproduced.
 """
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.lines import Line2D
-from scipy.spatial import procrustes
 from scipy.spatial.distance import cdist, pdist
-from sklearn.datasets import load_digits
 
-from skmatter.datasets import load_sketchmap_dimred_reference
 from skmatter.decomposition import SketchMap
 from skmatter.sample_selection import FPS, voronoi_weights
 
@@ -152,107 +148,17 @@ fig.tight_layout()
 
 
 # %%
-# Validating against the reference C++ implementation
-# ---------------------------------------------------
+# Reproducing a published sketch-map
+# ----------------------------------
 #
 # sketch-map originates from a reference C++ code (`sketchmap.org
-# <https://sketchmap.org>`_), so the rest of this example checks that
-# :class:`~skmatter.decomposition.SketchMap` reproduces it. We start with a small
-# dataset of the first 64 handwritten digits from :func:`sklearn.datasets.load_digits`,
-# each a 64-dimensional image.
-#
-# The reference embedding was produced with ``utils/sketch-map.sh``, the driver script
-# of the C++ sketch-map, which runs an iterative metric MDS, the sigmoid fit initialized
-# from it, and finally grid global optimization. The script asks for its inputs and then
-# assembles the ``dimred`` calls itself. For this reference we used:
-#
-# - dimensionality of the input data: ``64``
-# - weighted points: no, dot-product distances: no, periodicity: none
-# - high-dimension ``sigma, a, b``: ``30 4 2``
-# - low-dimension ``sigma, a, b``: ``30 2 2``
-#
-# The stress it reported for the final map is 0.0129757, and ``dimred`` is
-# deterministic, so its output coordinates ship with scikit-matter as
-# :func:`~skmatter.datasets.load_sketchmap_dimred_reference`. We fit with the identical
-# parameters, so any agreement comes from the algorithm alone rather than from a
-# different choice of sigmoid.
-
-digits = load_digits().data[:64].astype(np.float64)
-digit_labels = load_digits().target[:64]
-
-reference_embedding = load_sketchmap_dimred_reference().data
-reference_stress = 0.0129757
-reference_params = dict(sigma=30.0, a_high=4.0, b_high=2.0, a_low=2.0, b_low=2.0)
-
-validation = SketchMap(n_components=2, **reference_params)
-validation_embedding = validation.fit_transform(digits)
-
-print(f"C++ reported stress: {reference_stress:.6f}")
-print(f"our fit stress     : {validation.stress_:.6f}")
-
-# %%
-# Comparing the maps
-# ------------------
-#
-# sketch-map is invariant to rotation and reflection, so we align the two embeddings
-# with a Procrustes transform before plotting. The disparity it returns is 0 when the
-# maps are identical up to that alignment.
-
-reference_aligned, validation_aligned, disparity = procrustes(
-    reference_embedding, validation_embedding
-)
-print(f"Procrustes disparity: {disparity:.4f}")
-
-digit_cmap = plt.get_cmap("tab10")
-fig, axes = plt.subplots(1, 2, figsize=(9, 5))
-for ax, coords, title in [
-    (axes[0], reference_aligned, "reference C++"),
-    (axes[1], validation_aligned, "scikit-matter"),
-]:
-    ax.scatter(
-        coords[:, 0],
-        coords[:, 1],
-        c=digit_labels,
-        cmap=digit_cmap,
-        vmin=0,
-        vmax=9,
-        s=45,
-        edgecolor="white",
-        linewidth=0.4,
-    )
-    ax.set_title(title)
-    ax.set_xlabel("SMAP1")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_aspect("equal", "box")
-axes[0].set_ylabel("SMAP2")
-
-handles = [
-    Line2D(
-        [],
-        [],
-        marker="o",
-        linestyle="",
-        markersize=7,
-        markerfacecolor=digit_cmap(i),
-        markeredgecolor="white",
-        label=str(i),
-    )
-    for i in range(10)
-]
-fig.legend(handles=handles, title="digit", loc="center right", frameon=False)
-fig.subplots_adjust(left=0.02, right=0.88, wspace=0.05)
-
-# %%
-# Validation on a published sketch-map
-# ------------------------------------
-#
-# The strongest validation of the implementation is the protein sketch-map of Ardevol et
-# al., *J. Chem. Theory Comput.* 2015, 11(3), 1086-1093 (DOI `10.1021/ct500950z
-# <https://doi.org/10.1021/ct500950z>`_). It is 1000 weighted landmarks of 30
-# Ramachandran angles whose published 2D projection ships with the reference C++. That
-# data is GPL-licensed, so it is not included here and this section is not executed. The
-# recipe and the resulting numbers are reproduced below.
+# <https://sketchmap.org>`_), and the scikit-matter test suite validates this
+# implementation against its output. The strongest check is the protein sketch-map of
+# Ardevol et al., *J. Chem. Theory Comput.* 2015, 11(3), 1086-1093 (DOI
+# `10.1021/ct500950z <https://doi.org/10.1021/ct500950z>`_). It is 1000 weighted
+# landmarks of 30 Ramachandran angles whose published 2D projection ships with the
+# reference C++. That data is GPL-licensed, so it is not included here and this section
+# is not executed. The recipe and the resulting numbers are reproduced below.
 #
 # The dihedral angles are periodic, so the distances are computed on the torus and
 # passed in with ``dissimilarity="precomputed"``.
@@ -312,7 +218,7 @@ fig.subplots_adjust(left=0.02, right=0.88, wspace=0.05)
 # deep minimum with the same structure. The Python fit behaves similarly and its
 # intermediate errors track the C++ annealing ten steps loop round by round.
 #
-# .. figure:: /figures/protein_maps.png
+# .. figure:: /figures/protein_maps.svg
 #    :align: center
 #    :width: 100%
 #
