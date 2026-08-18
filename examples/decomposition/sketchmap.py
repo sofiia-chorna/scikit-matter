@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+# sphinx_gallery_thumbnail_number = 2
 r"""
 sketch-map: nonlinear dimensionality reduction
 ==============================================
@@ -9,9 +10,10 @@ sketch-map [Ceriotti2011]_ is a nonlinear dimensionality-reduction algorithm for
 atomistic simulations, where configurations cluster into basins. Only intermediate
 distances are informative there, as short ones measure thermal fluctuations inside a
 basin and long ones only say that two configurations lie in different basins. Methods
-that reproduce all distances equally, like MDS, or maximize retained variance, like PCA,
-let these extremes shape the map. sketch-map instead passes distances through a sigmoid
-first, so that the embedding is based on the informative range.
+that reproduce all distances equally, like :class:`~sklearn.manifold.MDS`, or maximize
+retained variance, like :class:`~sklearn.decomposition.PCA`, let these extremes shape
+the map. sketch-map instead passes distances through a sigmoid first, so that the
+embedding is based on the informative range.
 
 The sigmoid has a switching distance :math:`\sigma`. Distances well below :math:`\sigma`
 are squashed toward zero and distances well above it toward one, so both extremes stop
@@ -106,9 +108,9 @@ weights = voronoi_weights(X, landmarks)
 # ----------------------------------------
 #
 # All five sigmoid parameters default to ``None``, in which case they are estimated from
-# the data, so ``SketchMap()`` can be fitted without tuning anything. The values it
-# settled on are kept in ``params_``, and passing any of them to the constructor
-# overrides just that one.
+# the data, so :class:`~skmatter.decomposition.SketchMap` can be fitted without tuning
+# anything. The values it settled on are kept in ``params_``, and passing any of them to
+# the constructor overrides just that one.
 
 sm = SketchMap().fit(landmarks, sample_weight=weights)
 for name, value in sm.params_.items():
