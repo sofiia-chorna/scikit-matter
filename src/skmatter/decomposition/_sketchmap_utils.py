@@ -141,22 +141,6 @@ def _gaussian(x, amplitude, center, std_dev):
     return amplitude * np.exp(-((x - center) ** 2) / (2 * std_dev**2))
 
 
-def _maybe_tqdm(iterable, enabled, **tqdm_kwargs):
-    """Wrap an iterable in a tqdm progress bar when ``enabled``"""
-    if not enabled:
-        return iterable
-
-    try:
-        from tqdm import tqdm
-    except ImportError as error:
-        raise ImportError(
-            "progress_bar=True requires the optional dependency 'tqdm'. "
-            "install it with 'pip install tqdm'"
-        ) from error
-
-    return tqdm(iterable, **tqdm_kwargs)
-
-
 def _analyze_distance_distribution(distances, n_bins=200, sample_weight=None):
     """Do analysis of the pairwise-distance distribution which is necessary for
     automatic sketch-map parameter estimation

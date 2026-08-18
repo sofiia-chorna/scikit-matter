@@ -5,9 +5,9 @@ from scipy.spatial.distance import cdist
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import validate_data
 
+from ..utils import get_progress_bar
 from ._sketchmap_utils import (
     _classical_mds,
-    _maybe_tqdm,
     _sigmoid_and_derivative,
     _sigmoid_transform,
     _suggest_sigmoid_params,
@@ -441,6 +441,12 @@ class SketchMap(TransformerMixin, BaseEstimator):
 
         return result.x.reshape(initial_embedding.shape)
 
+    def _progress(self, iterable, description):
+        if not self.progress_bar:
+            return iterable
+
+        return get_progress_bar()(iterable, desc=description)
+
     def _global_optimize(self, embedding, problem, schedule, global_refine_steps=100):
         """Escape local minima by graduated (annealed) gradient optimization.
 
@@ -450,7 +456,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         one. Because it only follows the gradient, points whose distances are already
         saturated do not move, since their gradient vanishes.
         """
-        levels = _maybe_tqdm(schedule, self.progress_bar, desc="Annealing")
+        levels = self._progress(schedule, "Annealing")
         for mixing in levels:
             if self.verbose:
                 print(f"  mixing={mixing:.4g}")
@@ -551,7 +557,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         """
         embedding = embedding.copy()
 
-        cycles = _maybe_tqdm(range(n_cycles), self.progress_bar, desc="Grid")
+        cycles = self._progress(range(n_cycles), "Grid")
 
         for _ in cycles:
             embedding = self._optimize(
@@ -584,7 +590,7 @@ class SketchMap(TransformerMixin, BaseEstimator):
         mixing = 1.0
         previous_error = None
 
-        rounds = _maybe_tqdm(range(n_rounds), self.progress_bar, desc="Annealed grid")
+        rounds = self._progress(range(n_rounds), "Annealed grid")
 
         for round_index in rounds:
             embedding = self._optimize(
