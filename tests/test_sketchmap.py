@@ -1,3 +1,5 @@
+from os.path import dirname, join
+
 import numpy as np
 import pytest
 from scipy.spatial import procrustes
@@ -5,7 +7,6 @@ from scipy.spatial.distance import cdist, pdist, squareform
 from sklearn.base import clone
 from sklearn.datasets import load_digits
 
-from skmatter.datasets import load_sketchmap_dimred_reference
 from skmatter.decomposition import SketchMap
 from skmatter.decomposition._sketchmap_utils import (
     _analyze_distance_distribution,
@@ -441,6 +442,28 @@ class TestSketchMap:
         with pytest.raises(ValueError, match="at least two positive entries"):
             quick_sketchmap().fit(X, sample_weight=weights)
 
+    def test_annealed_grid_stress_regression(self):
+        # test of the same grid annealed pipeline as in the c++
+        rng = np.random.default_rng(0)
+        X = np.vstack(
+            [
+                center + rng.normal(0, 0.5, (30, 6))
+                for center in rng.normal(0, 4, (4, 6))
+            ]
+        )
+
+        sm = SketchMap(
+            sigma=4.0,
+            a_high=4.0,
+            b_high=2.0,
+            a_low=2.0,
+            b_low=2.0,
+            global_optimizer="grid",
+            mixing_schedule="auto",
+        ).fit(X)
+
+        np.testing.assert_allclose(sm.stress_, 2.34413e-4, rtol=1e-3)
+
 
 class TestHelperFunctions:
     def test_sigmoid_transform(self):
@@ -577,8 +600,8 @@ class TestHelperFunctions:
 class TestReferenceCpp:
     """Validate against the reference C++ ``dimred`` from sketchmap.org.
 
-    :func:`~skmatter.datasets.load_sketchmap_dimred_reference` returns the embedding
-    produced by the C++ implementation on ``load_digits().data[:64]``
+    ``tests/data/sketchmap_dimred_reference.dat`` was computed with the C++ code on
+    ``load_digits().data[:64]``, see its header for the exact settings
     """
 
     params = dict(sigma=30.0, a_high=4.0, b_high=2.0, a_low=2.0, b_low=2.0)
@@ -587,7 +610,9 @@ class TestReferenceCpp:
     @pytest.fixture(scope="class")
     def fitted(self):
         X = load_digits().data[:64].astype(np.float64)
-        cpp_map = load_sketchmap_dimred_reference().data
+        cpp_map = np.loadtxt(
+            join(dirname(__file__), "data", "sketchmap_dimred_reference.dat")
+        )
         sm = SketchMap(n_components=2, **self.params).fit(X)
         return X, cpp_map, sm
 

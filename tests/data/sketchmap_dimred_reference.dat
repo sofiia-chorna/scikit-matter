@@ -1,3 +1,6 @@
+# Sketch-map embedding of sklearn.datasets.load_digits().data[:64], produced by the
+# reference C++ implementation (dimred from https://sketchmap.org) through its
+# utils/sketch-map.sh pipeline with -fun-hd 30,4,2 -fun-ld 30,2,2.
 # Columns: y1 y2. Reported ld_error (stress): 0.0129757
 1.384496122283e+00 -2.687210383041e+01
 -4.615122458727e+00 4.959365323961e+01

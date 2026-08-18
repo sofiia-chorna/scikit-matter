@@ -9,6 +9,4 @@ Datasets
 
 .. include:: ../../../src/skmatter/datasets/descr/nice_dataset.rst
 
-.. include:: ../../../src/skmatter/datasets/descr/sketchmap_dimred_reference.rst
-
 .. include:: ../../../src/skmatter/datasets/descr/who_dataset.rst

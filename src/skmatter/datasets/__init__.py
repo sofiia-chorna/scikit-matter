@@ -6,7 +6,6 @@ from ._base import (
     load_hbond_dataset,
     load_nice_dataset,
     load_roy_dataset,
-    load_sketchmap_dimred_reference,
     load_who_dataset,
 )
 
@@ -17,6 +16,5 @@ __all__ = [
     "load_hbond_dataset",
     "load_nice_dataset",
     "load_roy_dataset",
-    "load_sketchmap_dimred_reference",
     "load_who_dataset",
 ]
